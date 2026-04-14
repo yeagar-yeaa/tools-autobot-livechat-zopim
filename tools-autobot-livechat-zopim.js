@@ -3,8 +3,705 @@
 
   try { if (window._s1panelKill) window._s1panelKill(); } catch (_) {}
 
-  const META = { NAME: "Autobot LiveChat", VERSION: "vNext Arbiter by yeagarr" };
+  const META = { NAME: "Autobot LiveChat", VERSION: "Omniscient Hybrid Edition" };
   const UI = { PANEL_ID: "s1-puck", STYLE_ID: "s1-style", CB_STYLE_ID: "s1-chatbar-style" };
+
+  const _mc = (typeof MessageChannel !== "undefined") ? new MessageChannel() : null;
+  const _mcQueue = [];
+  if (_mc) {
+    _mc.port2.onmessage = () => {
+      const batch = _mcQueue.splice(0, _mcQueue.length);
+      for (let i = 0; i < batch.length; i++) {
+        try { batch[i](); } catch (_) {}
+      }
+    };
+  }
+  const fastMicrotask = (fn) => {
+    if (_mc) {
+      _mcQueue.push(fn);
+      _mc.port1.postMessage(0);
+    } else {
+      try {
+        (typeof queueMicrotask === "function" ? queueMicrotask : (f) => Promise.resolve().then(f))(fn);
+      } catch (_) { try { setTimeout(fn, 0); } catch (__) {} }
+    }
+  };
+
+
+  const wsIntercept = {
+    installed: false,
+    enabled: true,
+    sockets: new Set(),
+    origOnMsg: new WeakMap(),
+    lastSignalAt: 0,
+    _origWSClass: null,
+    CHAT_PATTERNS: [
+      /incoming/i,
+      /new_visitor/i,
+      /chat_start/i,
+      /queue_update/i,
+      /routing/i,
+      /assign/i,
+      /"type"\s*:\s*"(chat|visitor|routing|queue)"/i,
+      /serve.*request/i,
+      /pending_chat/i,
+    ],
+    VISITOR_PATTERNS: [
+      /visitor.*joined/i,
+      /visitor.*left/i,
+      /visitor_count/i,
+      /queue_size/i,
+    ],
+    install() {
+      if (this.installed || !CFG.WS_INTERCEPT_ENABLE) return;
+      const self = this;
+      const OrigWS = window.WebSocket;
+      if (typeof OrigWS !== "function") return;
+      this._origWSClass = OrigWS;
+      window.WebSocket = function(...args) {
+        const ws = new OrigWS(...args);
+        try { self.hookSocket(ws); } catch (_) {}
+        return ws;
+      };
+      window.WebSocket.prototype = OrigWS.prototype;
+      window.WebSocket.CONNECTING = OrigWS.CONNECTING;
+      window.WebSocket.OPEN = OrigWS.OPEN;
+      window.WebSocket.CLOSING = OrigWS.CLOSING;
+      window.WebSocket.CLOSED = OrigWS.CLOSED;
+      this.installed = true;
+    },
+    hookSocket(ws) {
+      if (!ws || this.sockets.has(ws)) return;
+      this.sockets.add(ws);
+      const self = this;
+      const origAddListener = ws.addEventListener?.bind(ws);
+      if (origAddListener) {
+        ws.addEventListener = function(type, listener, ...rest) {
+          if (type === "message" && typeof listener === "function") {
+            const wrapped = function(event) {
+              self.onFrame(event);
+              return listener.call(this, event);
+            };
+            return origAddListener(type, wrapped, ...rest);
+          }
+          return origAddListener(type, listener, ...rest);
+        };
+      }
+      const desc = Object.getOwnPropertyDescriptor(this._origWSClass?.prototype || WebSocket.prototype, "onmessage")
+        || Object.getOwnPropertyDescriptor(ws, "onmessage");
+      if (desc) {
+        try {
+          Object.defineProperty(ws, "onmessage", {
+            get() { return self.origOnMsg.get(ws) || null; },
+            set(fn) {
+              self.origOnMsg.set(ws, fn);
+              const wrapped = function(event) {
+                self.onFrame(event);
+                if (typeof fn === "function") return fn.call(this, event);
+              };
+              if (desc.set) desc.set.call(ws, wrapped);
+            },
+            configurable: true
+          });
+        } catch (_) {}
+      }
+      try { ws.addEventListener?.("message", (e) => self.onFrame(e), { passive: true }); } catch (_) {}
+    },
+    onFrame(event) {
+      try {
+        if (!on) return;
+        const data = typeof event?.data === "string" ? event.data : "";
+        if (!data) return;
+        let isChatSignal = false;
+        let isVisitorSignal = false;
+        for (const re of this.CHAT_PATTERNS) {
+          if (re.test(data)) { isChatSignal = true; break; }
+        }
+        for (const re of this.VISITOR_PATTERNS) {
+          if (re.test(data)) { isVisitorSignal = true; break; }
+        }
+        if (!isChatSignal && !isVisitorSignal) return;
+        const t = now();
+        if ((t - this.lastSignalAt) < 8) return;
+        this.lastSignalAt = t;
+        STATS.wsInterceptHits += 1;
+        health.lastActivityAt = t;
+        scheduleBurst(CFG.BURST_MS);
+        try { if (CFG.TURBO_CLICK_ENABLE) turboClick.warmAll(); } catch (_) {}
+        try { if (CFG.PREDICT_ENABLE) predict.onSignal("ws"); } catch (_) {}
+        if (isVisitorSignal) visLastVisitorSignalAt = t;
+      } catch (_) {}
+    },
+    uninstall() {
+      try {
+        if (this._origWSClass) window.WebSocket = this._origWSClass;
+      } catch (_) {}
+      this.sockets.clear();
+      this.installed = false;
+    }
+  };
+
+  const multiTab = {
+    installed: false,
+    enabled: true,
+    channel: null,
+    tabId: Math.random().toString(36).slice(2, 10) + "_" + Date.now(),
+    isLeader: false,
+    leaderTabId: "",
+    leaderHeartbeatAt: 0,
+    peers: new Map(),
+    HEARTBEAT_MS: 2000,
+    LEADER_TIMEOUT_MS: 6000,
+    timer: 0,
+    install() {
+      if (this.installed) return;
+      if (!CFG.MULTI_TAB_ENABLE || typeof BroadcastChannel === "undefined") {
+        this.isLeader = true;
+        this.installed = true;
+        return;
+      }
+      try {
+        this.channel = new BroadcastChannel("autobot_livechat_coord");
+        this.channel.onmessage = (e) => this.onMessage(e.data);
+        this.broadcast({ type: "join", tabId: this.tabId, at: now() });
+        this.timer = setInterval(() => this.heartbeat(), this.HEARTBEAT_MS);
+        setTimeout(() => this.electLeader(), 500);
+        this.installed = true;
+      } catch (_) {
+        this.isLeader = true;
+        this.installed = true;
+      }
+    },
+    broadcast(msg) {
+      try { this.channel?.postMessage(msg); } catch (_) {}
+    },
+    onMessage(msg) {
+      try {
+        if (!msg || msg.tabId === this.tabId) return;
+        const t = now();
+        switch (msg.type) {
+          case "join":
+          case "heartbeat":
+            this.peers.set(msg.tabId, t);
+            if (msg.type === "heartbeat" && msg.tabId === this.leaderTabId) this.leaderHeartbeatAt = t;
+            if (!this.leaderTabId) this.electLeader();
+            break;
+          case "leader_claim":
+            this.leaderTabId = msg.tabId;
+            this.leaderHeartbeatAt = t;
+            this.isLeader = (msg.tabId === this.tabId);
+            break;
+          case "serve_claimed":
+            STATS.multiTabSkips += 1;
+            serveClaimLockUntil = Math.max(serveClaimLockUntil, t + 800);
+            break;
+          case "serve_timing":
+            try { predict.recordExternal(msg.interval); } catch (_) {}
+            break;
+          case "leave":
+            this.peers.delete(msg.tabId);
+            if (msg.tabId === this.leaderTabId) {
+              this.leaderTabId = "";
+              this.electLeader();
+            }
+            break;
+        }
+      } catch (_) {}
+    },
+    electLeader() {
+      const allIds = [this.tabId, ...this.peers.keys()].sort();
+      const newLeader = allIds[0] || this.tabId;
+      this.isLeader = (newLeader === this.tabId);
+      this.leaderTabId = newLeader;
+      if (this.isLeader) this.broadcast({ type: "leader_claim", tabId: this.tabId, at: now() });
+    },
+    heartbeat() {
+      const t = now();
+      this.broadcast({ type: "heartbeat", tabId: this.tabId, at: t });
+      for (const [id, lastSeen] of this.peers) {
+        if ((t - lastSeen) > this.LEADER_TIMEOUT_MS) {
+          this.peers.delete(id);
+          if (id === this.leaderTabId) {
+            this.leaderTabId = "";
+            this.electLeader();
+          }
+        }
+      }
+    },
+    canServe() {
+      if (!CFG.MULTI_TAB_ENABLE || !this.channel) return true;
+      if (this.isLeader) return true;
+      const t = now();
+      if (this.leaderTabId && (t - this.leaderHeartbeatAt) > this.LEADER_TIMEOUT_MS) return true;
+      return true;
+    },
+    claimServe() {
+      this.broadcast({ type: "serve_claimed", tabId: this.tabId, at: now() });
+    },
+    shareServeTime(interval) {
+      this.broadcast({ type: "serve_timing", tabId: this.tabId, interval, at: now() });
+    },
+    uninstall() {
+      try { this.broadcast({ type: "leave", tabId: this.tabId, at: now() }); } catch (_) {}
+      try { if (this.timer) clearInterval(this.timer); } catch (_) {}
+      try { this.channel?.close(); } catch (_) {}
+      this.channel = null;
+      this.timer = 0;
+      this.peers.clear();
+      this.installed = false;
+      this.isLeader = false;
+      this.leaderTabId = "";
+      this.leaderHeartbeatAt = 0;
+    }
+  };
+
+  let serveClaimLockUntil = 0;
+
+  const predict = {
+    enabled: true,
+    intervals: [],
+    lastServeAt: 0,
+    MAX_HISTORY: 50,
+    ema: 0,
+    emaVariance: 0,
+    EMA_ALPHA: 0.15,
+    prePositionTimer: 0,
+    isPrePositioned: false,
+    onServe() {
+      const t = now();
+      if (this.lastServeAt > 0) {
+        const interval = t - this.lastServeAt;
+        if (interval > 2000 && interval < 300000) {
+          this.intervals.push(interval);
+          if (this.intervals.length > this.MAX_HISTORY) this.intervals.shift();
+          if (this.ema === 0) {
+            this.ema = interval;
+            this.emaVariance = 0;
+          } else {
+            const diff = interval - this.ema;
+            this.ema = this.ema + this.EMA_ALPHA * diff;
+            this.emaVariance = (1 - this.EMA_ALPHA) * (this.emaVariance + this.EMA_ALPHA * diff * diff);
+          }
+          try { multiTab.shareServeTime(interval); } catch (_) {}
+          STATS.predictIntervals = this.intervals.length;
+          STATS.predictEmaMs = Math.round(this.ema);
+          STATS.predictStdDevMs = Math.round(Math.sqrt(this.emaVariance));
+        }
+      }
+      this.lastServeAt = t;
+      this.isPrePositioned = false;
+      this.schedulePrePosition();
+    },
+    recordExternal(interval) {
+      if (!interval || interval <= 2000 || interval >= 300000) return;
+      if (this.ema === 0) this.ema = interval;
+      else this.ema = this.ema + (this.EMA_ALPHA * 0.5) * (interval - this.ema);
+    },
+    onSignal(source) {
+      if (!CFG.PREDICT_ENABLE) return;
+      if (source === "ws") this.preActivate(200);
+      STATS.predictiveHits += 1;
+    },
+    schedulePrePosition() {
+      if (!CFG.PREDICT_ENABLE || this.ema === 0) return;
+      try { if (this.prePositionTimer) clearTimeout(this.prePositionTimer); } catch (_) {}
+      const stdDev = Math.sqrt(this.emaVariance) || 1000;
+      const earlyMs = Math.max(500, stdDev * 1.5);
+      const waitMs = Math.max(100, this.ema - earlyMs);
+      this.prePositionTimer = setTimeout(() => {
+        this.prePositionTimer = 0;
+        if (!on) return;
+        this.preActivate(earlyMs * 2);
+      }, waitMs);
+    },
+    preActivate(durationMs) {
+      if (!on || this.isPrePositioned || !CFG.PREDICT_ENABLE) return;
+      this.isPrePositioned = true;
+      STATS.predictPrePositions += 1;
+      try { if (CFG.TURBO_CLICK_ENABLE) turboClick.warmAll(); } catch (_) {}
+      scheduleBurst(Math.max(durationMs, CFG.BURST_MS));
+      setTimeout(() => { this.isPrePositioned = false; }, durationMs);
+    },
+    stop() {
+      try { if (this.prePositionTimer) clearTimeout(this.prePositionTimer); } catch (_) {}
+      this.prePositionTimer = 0;
+      this.isPrePositioned = false;
+    }
+  };
+
+  const fetchHook = {
+    installed: false,
+    origFetch: null,
+    origXHROpen: null,
+    origXHRSend: null,
+    INTERESTING_URLS: [
+      /routing/i,
+      /queue/i,
+      /incoming/i,
+      /chat.*list/i,
+      /visitor/i,
+      /serve/i,
+      /assignment/i,
+    ],
+    install() {
+      if (this.installed || !CFG.FETCH_HOOK_ENABLE) return;
+      const self = this;
+      this.origFetch = window.fetch;
+      if (typeof this.origFetch === "function") {
+        window.fetch = function(...args) {
+          const url = typeof args[0] === "string" ? args[0] : args[0]?.url || "";
+          const promise = self.origFetch.apply(this, args);
+          if (self.isInteresting(url) && promise && typeof promise.then === "function") {
+            promise.then((response) => {
+              try {
+                const clone = response.clone();
+                clone.text().then((body) => self.onResponse(url, body)).catch(() => {});
+              } catch (_) {}
+              return response;
+            }).catch(() => {});
+          }
+          return promise;
+        };
+      }
+      this.origXHROpen = XMLHttpRequest.prototype.open;
+      this.origXHRSend = XMLHttpRequest.prototype.send;
+      XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+        this._abUrl = url;
+        return self.origXHROpen.call(this, method, url, ...rest);
+      };
+      XMLHttpRequest.prototype.send = function(...args) {
+        const xhr = this;
+        if (self.isInteresting(xhr._abUrl || "")) {
+          xhr.addEventListener("load", () => {
+            try { self.onResponse(xhr._abUrl, xhr.responseText); } catch (_) {}
+          }, { passive: true, once: true });
+        }
+        return self.origXHRSend.apply(this, args);
+      };
+      this.installed = true;
+    },
+    isInteresting(url) {
+      if (!url) return false;
+      for (const re of this.INTERESTING_URLS) if (re.test(url)) return true;
+      return false;
+    },
+    onResponse(url, body) {
+      try {
+        if (!on || !body) return;
+        const hasQueue = /queue|pending|incoming|waiting/i.test(body);
+        const hasCount = /"count"\s*:\s*[1-9]/i.test(body);
+        if (hasQueue || hasCount) {
+          STATS.fetchHookHits += 1;
+          health.lastActivityAt = now();
+          scheduleBurst(CFG.BURST_MS);
+          try { if (CFG.TURBO_CLICK_ENABLE) turboClick.warmAll(); } catch (_) {}
+        }
+      } catch (_) {}
+    },
+    uninstall() {
+      try { if (this.origFetch) window.fetch = this.origFetch; } catch (_) {}
+      try { if (this.origXHROpen) XMLHttpRequest.prototype.open = this.origXHROpen; } catch (_) {}
+      try { if (this.origXHRSend) XMLHttpRequest.prototype.send = this.origXHRSend; } catch (_) {}
+      this.installed = false;
+    }
+  };
+
+  const visibilityTracker = {
+    installed: false,
+    observer: null,
+    visible: new WeakSet(),
+    install() {
+      if (this.installed || !CFG.INTERSECT_ENABLE || typeof IntersectionObserver === "undefined") return;
+      this.observer = new IntersectionObserver((entries) => {
+        for (const entry of entries) {
+          if (entry.isIntersecting && entry.intersectionRatio > 0) this.visible.add(entry.target);
+          else this.visible.delete(entry.target);
+        }
+      }, { threshold: [0, 0.1] });
+      this.installed = true;
+    },
+    track(el) {
+      try { if (this.observer && el && el.nodeType === 1) this.observer.observe(el); } catch (_) {}
+    },
+    untrack(el) {
+      try { if (this.observer && el) this.observer.unobserve(el); } catch (_) {}
+    },
+    isVisible(el) {
+      try { return this.visible.has(el); } catch (_) { return false; }
+    },
+    uninstall() {
+      try { this.observer?.disconnect(); } catch (_) {}
+      this.observer = null;
+      this.visible = new WeakSet();
+      this.installed = false;
+    }
+  };
+
+  const turboClick = {
+    cache: new WeakMap(),
+    CACHE_TTL_MS: 500,
+    warm(el) {
+      try {
+        if (!el || el.nodeType !== 1 || !el.isConnected) return;
+        const r = el.getBoundingClientRect();
+        if (r.width <= 0 || r.height <= 0) return;
+        this.cache.set(el, { cx: r.left + r.width * 0.5, cy: r.top + r.height * 0.5, at: now() });
+      } catch (_) {}
+    },
+    warmAll() {
+      try {
+        for (let i = 0; i < wrapsList.length; i++) {
+          const w = wrapsList[i];
+          if (!w || !w.isConnected) continue;
+          this.warm(w);
+          const tgt = getClickableTarget(w);
+          if (tgt && tgt !== w) this.warm(tgt);
+        }
+      } catch (_) {}
+    },
+    get(el) {
+      const c = this.cache.get(el);
+      if (!c) return null;
+      if ((now() - c.at) > this.CACHE_TTL_MS) {
+        this.cache.delete(el);
+        return null;
+      }
+      return c;
+    },
+    fireWithCache(target) {
+      const cached = this.get(target);
+      if (!cached) return fireSequence(target);
+      try {
+        const w = target.ownerDocument?.defaultView || window;
+        const pt = ("ontouchstart" in w) ? "touch" : "mouse";
+        const { cx, cy } = cached;
+        const base = { bubbles:true, cancelable:true, view:w, clientX:cx, clientY:cy, composed:true };
+        const down = { ...base, button:0, buttons:1 };
+        const up = { ...base, button:0, buttons:0 };
+        try { target.focus({ preventScroll: true }); } catch (_) {}
+        dispatchMouseLike(target, "pointerover",  { ...base, pointerType:pt, isPrimary:true, pointerId:1 });
+        dispatchMouseLike(target, "pointerenter", { ...base, pointerType:pt, isPrimary:true, pointerId:1 });
+        dispatchMouseLike(target, "mouseover", base);
+        dispatchMouseLike(target, "mouseenter", base);
+        dispatchMouseLike(target, "pointerdown", { ...down, pointerType:pt, isPrimary:true, pointerId:1 });
+        dispatchMouseLike(target, "mousedown", down);
+        dispatchMouseLike(target, "pointerup", { ...up, pointerType:pt, isPrimary:true, pointerId:1 });
+        dispatchMouseLike(target, "mouseup", up);
+        dispatchMouseLike(target, "click", { ...base, button:0 });
+        STATS.turboClickHits += 1;
+        return true;
+      } catch (_) {
+        return fireSequence(target);
+      }
+    }
+  };
+
+  const audio = {
+    enabled: true,
+    ctx: null,
+    SERVE_FREQ: 880,
+    ERROR_FREQ: 220,
+    lastPlayAt: 0,
+    MIN_INTERVAL_MS: 800,
+    getCtx() {
+      if (this.ctx) return this.ctx;
+      try { this.ctx = new (window.AudioContext || window.webkitAudioContext)(); } catch (_) {}
+      return this.ctx;
+    },
+    playTone(freq, duration = 0.08, vol = 0.15) {
+      if (!CFG.AUDIO_ENABLE || !this.enabled) return;
+      const t = now();
+      if ((t - this.lastPlayAt) < this.MIN_INTERVAL_MS) return;
+      this.lastPlayAt = t;
+      try {
+        const ctx = this.getCtx();
+        if (!ctx) return;
+        if (ctx.state === "suspended") ctx.resume();
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = "sine";
+        osc.frequency.value = freq;
+        gain.gain.value = vol;
+        gain.gain.setValueAtTime(0, ctx.currentTime);
+        gain.gain.linearRampToValueAtTime(vol, ctx.currentTime + 0.005);
+        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + duration);
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start(ctx.currentTime);
+        osc.stop(ctx.currentTime + duration + 0.01);
+      } catch (_) {}
+    },
+    onServe() { this.playTone(this.SERVE_FREQ, 0.08, CFG.AUDIO_VOLUME || 0.12); },
+    onError() { this.playTone(this.ERROR_FREQ, 0.15, 0.08); },
+    uninstall() {
+      try { this.ctx?.close(); } catch (_) {}
+      this.ctx = null;
+    }
+  };
+
+  const perfWatcher = {
+    installed: false,
+    observer: null,
+    INTERESTING_RES: [
+      /routing/i, /queue/i, /incoming/i, /chat/i,
+      /visitor/i, /serve/i, /websocket/i, /socket/i
+    ],
+    install() {
+      if (this.installed || !CFG.PERF_WATCH_ENABLE || typeof PerformanceObserver === "undefined") return;
+      try {
+        this.observer = new PerformanceObserver((list) => {
+          if (!on) return;
+          const entries = list.getEntries();
+          for (const entry of entries) {
+            const name = entry.name || "";
+            for (const re of this.INTERESTING_RES) {
+              if (re.test(name)) {
+                STATS.perfWatcherHits += 1;
+                health.lastActivityAt = now();
+                scheduleBurst(800);
+                return;
+              }
+            }
+          }
+        });
+        this.observer.observe({ type: "resource", buffered: false });
+        this.installed = true;
+      } catch (_) {}
+    },
+    uninstall() {
+      try { this.observer?.disconnect(); } catch (_) {}
+      this.observer = null;
+      this.installed = false;
+    }
+  };
+
+  const smartRetry = {
+    getDelay(attempt, baseMs = 50) {
+      const exp = Math.min(500, baseMs * Math.pow(1.5, Math.max(0, attempt || 0)));
+      const jitter = exp * 0.25 * (Math.random() * 2 - 1);
+      return Math.max(10, Math.round(exp + jitter));
+    }
+  };
+
+  const selfHeal = {
+    installed: false,
+    lastDOMSignature: "",
+    CHECK_MS: 3000,
+    timer: 0,
+    getDOMSignature() {
+      try {
+        const body = document.body;
+        if (!body) return "";
+        const navBar = document.querySelector(".react_meshim_dashboard_components_navBar") || document.querySelector("[class*='navBar']");
+        const chatBar = document.querySelector(CFG.CB_ITEM_SEL);
+        const panel = document.querySelector(CFG.AS_ACTIVE_PANEL_SEL);
+        return [
+          navBar ? "nav:1" : "nav:0",
+          chatBar ? "cb:1" : "cb:0",
+          panel ? "panel:1" : "panel:0",
+          body.children.length,
+        ].join("|");
+      } catch (_) { return ""; }
+    },
+    check() {
+      if (!this.installed || !on) return;
+      const sig = this.getDOMSignature();
+      if (this.lastDOMSignature && sig !== this.lastDOMSignature) {
+        STATS.selfHealTriggers += 1;
+        this.heal();
+      }
+      this.lastDOMSignature = sig;
+    },
+    heal() {
+      try {
+        resyncWraps(true);
+        cbUnwire();
+        cbWire();
+        visUnwire();
+        visWire();
+        try { document.querySelectorAll("iframe").forEach(wireFrame); } catch (_) {}
+        scheduleBurst(CFG.BURST_MS);
+        cbKick();
+        visKick(true);
+        asKick("heal");
+      } catch (_) {}
+    },
+    install() {
+      if (this.installed || !CFG.SELF_HEAL_ENABLE) return;
+      this.lastDOMSignature = this.getDOMSignature();
+      this.timer = setInterval(() => this.check(), this.CHECK_MS);
+      this.installed = true;
+    },
+    uninstall() {
+      try { if (this.timer) clearInterval(this.timer); } catch (_) {}
+      this.timer = 0;
+      this.installed = false;
+    }
+  };
+
+  const smartSchedule = (fn, priority = "user-blocking") => {
+    try {
+      if (typeof scheduler !== "undefined" && scheduler.postTask) return scheduler.postTask(fn, { priority });
+    } catch (_) {}
+    fastMicrotask(fn);
+  };
+
+  const idleDetect = {
+    detector: null,
+    isIdle: false,
+    async install() {
+      if (!CFG.IDLE_DETECT_ENABLE || typeof IdleDetector === "undefined") return;
+      try {
+        const perm = await IdleDetector.requestPermission();
+        if (perm !== "granted") return;
+        this.detector = new IdleDetector();
+        this.detector.addEventListener("change", () => {
+          const userIdle = this.detector.userState === "idle";
+          const screenLocked = this.detector.screenState === "locked";
+          this.isIdle = userIdle || screenLocked;
+          if (this.isIdle) {
+            CFG.POLL_FAST_MS = 8;
+            CFG.BG_WORKER_TICK_MS = 15;
+          } else {
+            CFG.POLL_FAST_MS = 16;
+            CFG.BG_WORKER_TICK_MS = 30;
+          }
+        });
+        await this.detector.start({ threshold: 30000 });
+      } catch (_) {}
+    },
+    uninstall() {
+      try { this.detector?.stop?.(); } catch (_) {}
+      this.detector = null;
+      this.isIdle = false;
+    }
+  };
+
+  const startAllConcepts = () => {
+    try { wsIntercept.install(); } catch (_) {}
+    try { fetchHook.install(); } catch (_) {}
+    try { multiTab.install(); } catch (_) {}
+    try { visibilityTracker.install(); } catch (_) {}
+    try { perfWatcher.install(); } catch (_) {}
+    try { selfHeal.install(); } catch (_) {}
+    try { idleDetect.install(); } catch (_) {}
+    if (CFG.TURBO_CLICK_ENABLE) {
+      try { turboClick.warmAll(); } catch (_) {}
+    }
+    audio.enabled = !!CFG.AUDIO_ENABLE;
+  };
+
+  const stopAllConcepts = () => {
+    try { wsIntercept.uninstall(); } catch (_) {}
+    try { fetchHook.uninstall(); } catch (_) {}
+    try { multiTab.uninstall(); } catch (_) {}
+    try { visibilityTracker.uninstall(); } catch (_) {}
+    try { perfWatcher.uninstall(); } catch (_) {}
+    try { selfHeal.uninstall(); } catch (_) {}
+    try { idleDetect.uninstall(); } catch (_) {}
+    try { audio.uninstall(); } catch (_) {}
+    try { predict.stop(); } catch (_) {}
+  };
 
   const CFG = {
     WRAP_SEL: ".react_meshim_dashboard_components_navBar_OldServeButton",
@@ -17,36 +714,36 @@
     ZERO_POKE_MODE: "off",
     ZERO_POKE_VISITOR_GRACE_MS: 1600,
 
-    READY_COOLDOWN_MS: 18,
-    ZERO_COOLDOWN_MS: 120,
+    READY_COOLDOWN_MS: 4,
+    ZERO_COOLDOWN_MS: 80,
 
-    GLOBAL_COOLDOWN_MS: 8,
+    GLOBAL_COOLDOWN_MS: 2,
     GLOBAL_WINDOW_MS: 5000,
-    GLOBAL_MAX_CLICKS_PER_WINDOW: 140,
+    GLOBAL_MAX_CLICKS_PER_WINDOW: 200,
 
-    BURST_MS: 2400,
-    HOT_BURST_FIRST_MS: 720,
-    MO_BURST_THROTTLE_MS: 3,
+    BURST_MS: 4000,
+    HOT_BURST_FIRST_MS: 1400,
+    MO_BURST_THROTTLE_MS: 0,
 
-    WRAP_RESYNC_MS: 1200,
-    WRAP_PRUNE_EVERY_MS: 1800,
-    MAX_SCAN: 40,
-    STOP_SCAN_AFTER_CLICK: true,
-    IDLE_STOP_AFTER_FRAMES: 22,
+    WRAP_RESYNC_MS: 800,
+    WRAP_PRUNE_EVERY_MS: 1200,
+    MAX_SCAN: 60,
+    STOP_SCAN_AFTER_CLICK: false,
+    IDLE_STOP_AFTER_FRAMES: 30,
 
-    POLL_FAST_MS: 45,
-    POLL_SLOW_MS: 180,
+    POLL_FAST_MS: 16,
+    POLL_SLOW_MS: 120,
 
-    VERIFY_READY_DELAY_MS: 54,
-    VERIFY_ZERO_DELAY_MS: 120,
-    RETRY_READY_MAX: 4,
-    RETRY_ZERO_MAX: 1,
-    RETRY_BURST_MS: 150,
+    VERIFY_READY_DELAY_MS: 16,
+    VERIFY_ZERO_DELAY_MS: 60,
+    RETRY_READY_MAX: 6,
+    RETRY_ZERO_MAX: 2,
+    RETRY_BURST_MS: 80,
 
-    USER_GRACE_ON_DOWN_MS: 650,
-    USER_GRACE_AFTER_UP_MS: 90,
-    USER_GRACE_ON_WHEEL_MS: 220,
-    USER_GRACE_ON_KEY_MS: 280,
+    USER_GRACE_ON_DOWN_MS: 400,
+    USER_GRACE_AFTER_UP_MS: 40,
+    USER_GRACE_ON_WHEEL_MS: 120,
+    USER_GRACE_ON_KEY_MS: 160,
 
     VIS_ENABLE: true,
     VIS_INCOMING_SEL: '[data-test-id="incomingList"]',
@@ -57,11 +754,11 @@
     VIS_ROW_TIME_SEL: '[data-test-id="timeCell"]',
     VIS_ROW_SERVED_SEL: '[data-test-id="servedByCell"]',
     VIS_ROW_VIEWING_SEL: '[data-test-id="viewingPage"]',
-    VIS_ROW_SCAN_LIMIT: 220,
-    VIS_WAKE_BURST_MS: 760,
-    VIS_HARD_WAKE_BURST_MS: 1200,
-    VIS_SCAN_MS: 260,
-    VIS_RESYNC_MS: 320,
+    VIS_ROW_SCAN_LIMIT: 300,
+    VIS_WAKE_BURST_MS: 600,
+    VIS_HARD_WAKE_BURST_MS: 1000,
+    VIS_SCAN_MS: 160,
+    VIS_RESYNC_MS: 200,
     VIS_UNSERVED_ONLY: true,
 
     CB_ITEM_SEL: ".meshim_dashboard_components_chatBar_Renderer.chat_bar_renderer",
@@ -84,22 +781,22 @@
 
     CB_AUTO_CLOSE_LEAVE: true,
     CB_CLOSE_ONLY_IF_UNREAD_ZERO: true,
-    CB_CLOSE_COOLDOWN_MS: 1200,
+    CB_CLOSE_COOLDOWN_MS: 800,
     CB_CLOSE_WINDOW_MS: 8000,
-    CB_CLOSE_MAX_PER_WINDOW: 6,
+    CB_CLOSE_MAX_PER_WINDOW: 8,
 
-    CB_IDLE_REQUIRED_MS: 70,
-    CB_OPEN_COOLDOWN_MS: 170,
-    CB_ITEM_OPEN_COOLDOWN_MS: 520,
-    CB_POST_CLICK_LOCK_MS: 160,
+    CB_IDLE_REQUIRED_MS: 30,
+    CB_OPEN_COOLDOWN_MS: 60,
+    CB_ITEM_OPEN_COOLDOWN_MS: 300,
+    CB_POST_CLICK_LOCK_MS: 80,
 
     CB_OPEN_IGNORE_IDLE_ON_UNREAD: true,
 
-    CB_SCAN_LIMIT: 240,
-    CB_FAST_SCAN_MS: 110,
-    CB_SLOW_SCAN_MS: 720,
-    CB_IDLE_TO_SLOW_AFTER_MS: 2400,
-    CB_FORCE_RESCAN_AFTER_MS: 4200,
+    CB_SCAN_LIMIT: 300,
+    CB_FAST_SCAN_MS: 40,
+    CB_SLOW_SCAN_MS: 400,
+    CB_IDLE_TO_SLOW_AFTER_MS: 1600,
+    CB_FORCE_RESCAN_AFTER_MS: 2800,
 
     CB_CLICK_X_RATIO: 0.35,
     CB_CLICK_Y_RATIO: 0.55,
@@ -116,13 +813,13 @@
 
     AS_ENABLE: true,
     AS_TRIGGER: "/a",
-    AS_SCAN_MS: 90,
-    AS_OPEN_SETTLE_MS: 260,
-    AS_EXPAND_WAIT_MS: 1400,
-    AS_SEND_LOCK_MS: 2200,
-    AS_MAX_TRIES_PER_CHAT: 2,
-    AS_MEMORY_SENT_LIMIT: 260,
-    AS_MEMORY_TRY_LIMIT: 520,
+    AS_SCAN_MS: 30,
+    AS_OPEN_SETTLE_MS: 80,
+    AS_EXPAND_WAIT_MS: 600,
+    AS_SEND_LOCK_MS: 800,
+    AS_MAX_TRIES_PER_CHAT: 3,
+    AS_MEMORY_SENT_LIMIT: 400,
+    AS_MEMORY_TRY_LIMIT: 600,
     AS_ACTIVE_ITEM_SEL: ".meshim_dashboard_components_chatBar_Renderer.chat_bar_renderer.active, .meshim_dashboard_components_chatBar_Renderer.chat_bar_renderer[aria-selected='true']",
     AS_COMPOSER_SEL: "[data-test-id='chatActionsComposer']",
     AS_NO_MATCH_SEL: ".textfieldlist_container > .no_matches",
@@ -132,22 +829,22 @@
     AS_ROOT_SEL: ".meshim_dashboard_components_chatPanel_ChatTextArea",
     AS_ACTIVE_PANEL_SEL: ".meshim_dashboard_components_ChatPanel.chat_panel.active",
     AS_PANEL_TITLE_SEL: "[data-test-id='displayNameTitleBar']",
-    AS_SEND_VERIFY_MS: 700,
+    AS_SEND_VERIFY_MS: 400,
     AS_REQUIRE_LATEST_SERVE_ONLY: true,
-    AS_SERVE_BIND_SETTLE_MS: 140,
-    AS_SERVE_BIND_FALLBACK_MS: 900,
-    AS_SELECT_WAIT_MS: 140,
+    AS_SERVE_BIND_SETTLE_MS: 80,
+    AS_SERVE_BIND_FALLBACK_MS: 500,
+    AS_SELECT_WAIT_MS: 80,
     AS_ONE_SEND_PER_SERVE: true,
-    AS_MAX_SEND_PRESSES: 1,
-    AS_TYPE_CHAR_DELAY_MS: 28,
-    AS_AFTER_TYPE_SETTLE_MS: 120,
+    AS_MAX_SEND_PRESSES: 2,
+    AS_TYPE_CHAR_DELAY_MS: 8,
+    AS_AFTER_TYPE_SETTLE_MS: 40,
     AS_REQUIRE_EXPAND_BEFORE_SEND: true,
-    AS_SERVE_TOKEN_TTL_MS: 12000,
+    AS_SERVE_TOKEN_TTL_MS: 15000,
     AS_CHATLOG_ROW_SEL: ".meshim_dashboard_components_widgets_ChatLogRenderer.chat_log_line",
     AS_CHATLOG_NAME_SEL: ".header_container .name",
     AS_CHATLOG_MSG_SEL: ".message_container .message",
-    AS_CHATLOG_SCAN_LIMIT: 80,
-    AS_PROOF_MIN_LEN: 8,
+    AS_CHATLOG_SCAN_LIMIT: 120,
+    AS_PROOF_MIN_LEN: 6,
     AS_AGENT_NAME_RE: /^(?:CS\d*[_A-Z0-9]*|ADMIN[_A-Z0-9]*|SUPPORT[_A-Z0-9]*)$/i,
     AS_SYSTEM_SKIP_RE: /\bhas\s+joined\b|\bhas\s+left\b|\brated the chat\b/i,
 
@@ -167,14 +864,14 @@
     AS_IGNORE_USER_BUSY_UNTIL: true,
 
     BG_WORKER_ENABLE: true,
-    BG_WORKER_TICK_MS: 60,
-    BG_WORKER_HIDDEN_TICK_MS: 220,
+    BG_WORKER_TICK_MS: 30,
+    BG_WORKER_HIDDEN_TICK_MS: 120,
 
     ACTION_ARB_ENABLE: true,
-    ACTION_ARB_DEBOUNCE_MS: 10,
-    ACTION_ARB_EXEC_LOCK_MS: 10,
-    ACTION_ARB_CB_LOCK_MS: 42,
-    ACTION_ARB_TTL_MS: 160,
+    ACTION_ARB_DEBOUNCE_MS: 0,
+    ACTION_ARB_EXEC_LOCK_MS: 2,
+    ACTION_ARB_CB_LOCK_MS: 16,
+    ACTION_ARB_TTL_MS: 100,
 
     S1_NATIVE_CLICK_FIRST: true,
     S1_STRICT_TOPMOST_CHECK: true,
@@ -183,6 +880,37 @@
 
     CB_NATIVE_CLICK_FIRST: true,
     CB_STRICT_TOPMOST_CHECK: true,
+
+    ADAPTIVE_ENABLE: true,
+    ADAPTIVE_FAST_STREAK_THRESHOLD: 3,
+    ADAPTIVE_ULTRA_COOLDOWN_MS: 1,
+    ADAPTIVE_STREAK_DECAY_MS: 8000,
+
+    PREDICT_ENABLE: true,
+    PREDICT_ZERO_WATCH_MS: 200,
+    PREDICT_PREFETCH_INTERVAL_MS: 50,
+
+    HEALTH_ENABLE: true,
+    HEALTH_CHECK_MS: 5000,
+    HEALTH_STALE_THRESHOLD_MS: 15000,
+    HEALTH_MAX_RECOVER_ATTEMPTS: 3,
+
+    JANK_THRESHOLD_MS: 100,
+    JANK_SCORE_LIMIT: 8,
+    JANK_ECO_DURATION_MS: 3000,
+    JANK_DECAY_RATE: 2,
+
+    WS_INTERCEPT_ENABLE: true,
+    FETCH_HOOK_ENABLE: true,
+    MULTI_TAB_ENABLE: true,
+    AUDIO_ENABLE: true,
+    AUDIO_ON_SERVE: true,
+    AUDIO_VOLUME: 0.12,
+    INTERSECT_ENABLE: true,
+    PERF_WATCH_ENABLE: true,
+    SELF_HEAL_ENABLE: true,
+    IDLE_DETECT_ENABLE: true,
+    TURBO_CLICK_ENABLE: true,
   };
 
   let on = true;
@@ -208,12 +936,37 @@
     serveNativeClick: 0,
     serveFallbackClick: 0,
     serveTopmostReject: 0,
+    serveTopmostBypass: 0,
     cbOpenQueued: 0,
     cbOpenClicked: 0,
     cbCloseQueued: 0,
     cbCloseClicked: 0,
     arbExecuted: 0,
-    arbDropped: 0
+    arbDropped: 0,
+
+    adaptiveUltraActivations: 0,
+    healthRecoveries: 0,
+    predictiveHits: 0,
+    totalBursts: 0,
+    avgServeLatencyMs: 0,
+    _serveLatencySum: 0,
+    _serveLatencyCount: 0,
+    wsInterceptHits: 0,
+    fetchHookHits: 0,
+    perfWatcherHits: 0,
+    turboClickHits: 0,
+    predictPrePositions: 0,
+    predictIntervals: 0,
+    predictEmaMs: 0,
+    predictStdDevMs: 0,
+    multiTabSkips: 0,
+    selfHealTriggers: 0,
+    multiTabPeers: 0,
+    isLeader: false,
+    predictNextServeIn: "unknown",
+    lastServeAt: 0,
+    uptime: 0,
+    startedAt: 0,
   };
 
   const ROOTS = new WeakSet();
@@ -221,8 +974,10 @@
   const IFRS = new WeakSet();
   const shortcutBinds = [];
 
-  const clickTimes = [];
-  let clickHead = 0;
+  const CLICK_RING_SIZE = 512;
+  const clickRing = new Float64Array(CLICK_RING_SIZE);
+  let clickRingHead = 0;
+  let clickRingTail = 0;
   let lastGlobalClickAt = 0;
 
   let burstUntil = 0;
@@ -249,6 +1004,21 @@
   let wrapsResyncAt = 0;
   let wrapsPruneAt = 0;
 
+  const adaptive = {
+    streak: 0,
+    lastServeAt: 0,
+    ultraUntil: 0,
+  };
+
+  const health = {
+    lastActivityAt: 0,
+    lastCheckAt: 0,
+    recoverAttempts: 0,
+    timer: 0,
+  };
+
+  let serveDetectedAt = 0;
+
   let visRootMO = null;
   let visScanTimer = 0;
   let visLastScanAt = 0;
@@ -258,23 +1028,18 @@
   const visRowState = new WeakMap();
 
   let asTimer = 0;
-  const asFlow = { key: "", step: "", stepAt: 0, openUntil: 0, ghostBase: "", proofText: "", lastSendAt: 0, sendPresses: 0, typedValue: "" };
-  const asServe = { armed: false, armedAt: 0, anchorKey: "", targetKey: "", sendKey: "", sendAt: 0, tokenSeq: 0 };
+  const asFlow = {
+    key: "", step: "", stepAt: 0, openUntil: 0,
+    ghostBase: "", proofText: "", lastSendAt: 0,
+    sendPresses: 0, typedValue: ""
+  };
+  const asServe = {
+    armed: false, armedAt: 0, anchorKey: "", targetKey: "",
+    sendKey: "", sendAt: 0, tokenSeq: 0
+  };
   const asSentKeys = new Set();
   const asTryCount = new Map();
   const asProofByKey = new Map();
-
-  function asHasPriorityLock() {
-    try {
-      if (!CFG.AS_ENABLE) return false;
-      const t = now();
-      if (asFlow.key) return true;
-      if (asServe.armed && (typeof asServeTokenExpired !== "function" || !asServeTokenExpired())) return true;
-      if (asFlow.lastSendAt && (t - asFlow.lastSendAt) < Math.max(CFG.AS_SEND_LOCK_MS, CFG.AS_SEND_VERIFY_MS)) return true;
-      if (asServe.sendAt && (t - asServe.sendAt) < Math.max(CFG.AS_SEND_VERIFY_MS, 650)) return true;
-      return false;
-    } catch (_) { return false; }
-  }
 
   const uiRM = { resize: null };
 
@@ -286,9 +1051,10 @@
 
   let onFocus = null, onVis = null, onPop = null;
 
-  const now = () => (performance && performance.now ? performance.now() : Date.now());
+  const now = performance.now.bind(performance);
   const norm = (t) => String(t || "").replace(/\s+/g, " ").trim();
   const safeAttr = (el, name) => { try { return el?.getAttribute?.(name) || ""; } catch (_) { return ""; } };
+
   const getNodeKey = (el, prefix = "n") => {
     try {
       if (!el || (typeof el !== "object" && typeof el !== "function")) return prefix + "0";
@@ -301,11 +1067,6 @@
     } catch (_) { return prefix + "x"; }
   };
 
-  const microtask = (fn) => {
-    try { (typeof queueMicrotask === "function" ? queueMicrotask : (f)=>Promise.resolve().then(f))(fn); }
-    catch (_) { try { setTimeout(fn, 0); } catch (__) {} }
-  };
-
   const markUserBusy = (ms) => {
     lastUserAt = now();
     const t = lastUserAt + ms;
@@ -316,14 +1077,20 @@
     if (!el || el.nodeType !== 1) return true;
     if (el.disabled) return true;
     const ad = safeAttr(el, "aria-disabled");
-    if (ad && ad.toLowerCase() === "true") return true;
-    return false;
+    return ad === "true";
   };
+
+  const _visCache = new WeakMap();
+  let _visCacheGen = 0;
 
   const isVisible = (el) => {
     try {
       if (!el || el.nodeType !== 1 || !el.isConnected) return false;
       if (isDisabledish(el)) return false;
+      if (CFG.INTERSECT_ENABLE && visibilityTracker.isVisible(el)) return true;
+
+      const cached = _visCache.get(el);
+      if (cached && cached.gen === _visCacheGen) return cached.val;
 
       const w = el.ownerDocument?.defaultView || window;
       const cs = w.getComputedStyle(el);
@@ -339,6 +1106,7 @@
       const pad = 2;
       if (r.bottom < -pad || r.right < -pad || r.left > vw + pad || r.top > vh + pad) return false;
 
+      _visCache.set(el, { gen: _visCacheGen, val: true });
       return true;
     } catch (_) { return false; }
   };
@@ -360,7 +1128,7 @@
       const vw = w.innerWidth || 0;
       const vh = w.innerHeight || 0;
       if (r.top < 0 || r.left < 0 || r.bottom > vh || r.right > vw) {
-        try { el.scrollIntoView({ block: "nearest", inline: "nearest" }); } catch (_) {}
+        try { el.scrollIntoView({ block: "nearest", inline: "nearest", behavior: "instant" }); } catch (_) {}
       }
     } catch (_) {}
   };
@@ -376,7 +1144,7 @@
   const isComposerBusy = () => {
     try {
       const t = now();
-      if ((t - composerCacheAt) < 120) return composerCacheVal;
+      if ((t - composerCacheAt) < 60) return composerCacheVal;
 
       let busy = false;
       const ae = document.activeElement;
@@ -422,20 +1190,66 @@
 
   const canServeEngineRun = () => canAct("ready");
 
-  const pruneClicks = (t) => {
-    while (clickHead < clickTimes.length && (t - clickTimes[clickHead]) > CFG.GLOBAL_WINDOW_MS) clickHead++;
-    if (clickHead > 96 && clickHead * 2 > clickTimes.length) {
-      clickTimes.splice(0, clickHead);
-      clickHead = 0;
+  const ringCount = () => {
+    if (clickRingTail >= clickRingHead) return clickRingTail - clickRingHead;
+    return CLICK_RING_SIZE - clickRingHead + clickRingTail;
+  };
+
+  const ringPush = (t) => {
+    clickRing[clickRingTail] = t;
+    clickRingTail = (clickRingTail + 1) % CLICK_RING_SIZE;
+    if (clickRingTail === clickRingHead) {
+      clickRingHead = (clickRingHead + 1) % CLICK_RING_SIZE;
+    }
+  };
+
+  const ringPrune = (t) => {
+    while (clickRingHead !== clickRingTail && (t - clickRing[clickRingHead]) > CFG.GLOBAL_WINDOW_MS) {
+      clickRingHead = (clickRingHead + 1) % CLICK_RING_SIZE;
     }
   };
 
   const globalThrottleOK = (t) => {
-    pruneClicks(t);
-    const live = clickTimes.length - clickHead;
-    if (live >= CFG.GLOBAL_MAX_CLICKS_PER_WINDOW) return false;
-    if ((t - lastGlobalClickAt) < CFG.GLOBAL_COOLDOWN_MS) return false;
+    ringPrune(t);
+    if (ringCount() >= CFG.GLOBAL_MAX_CLICKS_PER_WINDOW) return false;
+    if ((t - lastGlobalClickAt) < getEffectiveCooldown()) return false;
     return true;
+  };
+
+  const getEffectiveCooldown = () => {
+    if (!CFG.ADAPTIVE_ENABLE) return CFG.GLOBAL_COOLDOWN_MS;
+    const t = now();
+    if (t < adaptive.ultraUntil) return CFG.ADAPTIVE_ULTRA_COOLDOWN_MS;
+    return CFG.GLOBAL_COOLDOWN_MS;
+  };
+
+  const adaptiveOnServe = () => {
+    if (!CFG.ADAPTIVE_ENABLE) return;
+    const t = now();
+    const gap = t - adaptive.lastServeAt;
+
+    if (gap < CFG.ADAPTIVE_STREAK_DECAY_MS) {
+      adaptive.streak++;
+    } else {
+      adaptive.streak = 1;
+    }
+
+    adaptive.lastServeAt = t;
+
+    if (adaptive.streak >= CFG.ADAPTIVE_FAST_STREAK_THRESHOLD) {
+      adaptive.ultraUntil = t + CFG.ADAPTIVE_STREAK_DECAY_MS;
+      STATS.adaptiveUltraActivations++;
+    }
+  };
+
+  const recordServeLatency = () => {
+    if (serveDetectedAt > 0) {
+      const latency = now() - serveDetectedAt;
+      STATS._serveLatencySum += latency;
+      STATS._serveLatencyCount++;
+      STATS.avgServeLatencyMs = Math.round(STATS._serveLatencySum / STATS._serveLatencyCount);
+      serveDetectedAt = 0;
+    }
   };
 
   const actArb = { q: [], byKey: new Map(), timer: 0, busyUntil: 0 };
@@ -456,10 +1270,19 @@
   const actArbSchedule = (delay = CFG.ACTION_ARB_DEBOUNCE_MS) => {
     if (!CFG.ACTION_ARB_ENABLE) return;
     if (actArb.timer) return;
-    actArb.timer = setTimeout(() => {
-      actArb.timer = 0;
-      actArbDrain();
-    }, Math.max(0, delay | 0));
+
+    if (delay <= 0) {
+      actArb.timer = -1;
+      fastMicrotask(() => {
+        actArb.timer = 0;
+        actArbDrain();
+      });
+    } else {
+      actArb.timer = setTimeout(() => {
+        actArb.timer = 0;
+        actArbDrain();
+      }, delay);
+    }
   };
 
   const actArbEnqueue = (kind, key, priority, run, lockMs = CFG.ACTION_ARB_EXEC_LOCK_MS, ttlMs = CFG.ACTION_ARB_TTL_MS) => {
@@ -502,29 +1325,38 @@
     actArbPrune(t);
 
     if (t < actArb.busyUntil) {
-      actArbSchedule(Math.max(4, actArb.busyUntil - t));
+      actArbSchedule(Math.max(1, actArb.busyUntil - t));
       return;
     }
 
     if (!actArb.q.length) return;
 
     actArb.q.sort((a, b) => (b.priority - a.priority) || (a.createdAt - b.createdAt));
-    const item = actArb.q.shift();
-    if (!item) return;
 
-    if (actArb.byKey.get(item.key) === item) actArb.byKey.delete(item.key);
-    if (item.cancelled || item.expiresAt <= t) {
-      STATS.arbDropped += 1;
-      if (actArb.q.length) actArbSchedule();
-      return;
+    let drained = 0;
+    const maxDrain = 3;
+
+    while (actArb.q.length && drained < maxDrain) {
+      const item = actArb.q.shift();
+      if (!item) continue;
+
+      if (actArb.byKey.get(item.key) === item) actArb.byKey.delete(item.key);
+      if (item.cancelled || item.expiresAt <= now()) {
+        STATS.arbDropped += 1;
+        continue;
+      }
+
+      let ok = false;
+      try { ok = !!item.run(); } catch (_) {}
+      STATS.arbExecuted += ok ? 1 : 0;
+      if (!ok) STATS.arbDropped += 1;
+
+      actArb.busyUntil = now() + Math.max(0, item.lockMs || 0);
+      drained++;
+
+      if (item.lockMs > 1) break;
     }
 
-    let ok = false;
-    try { ok = !!item.run(); } catch (_) {}
-    STATS.arbExecuted += ok ? 1 : 0;
-    if (!ok) STATS.arbDropped += 1;
-
-    actArb.busyUntil = now() + Math.max(0, item.lockMs || 0);
     if (actArb.q.length) actArbSchedule();
   };
 
@@ -532,7 +1364,7 @@
     try {
       actArb.q.length = 0;
       actArb.byKey.clear();
-      if (actArb.timer) clearTimeout(actArb.timer);
+      if (actArb.timer && actArb.timer !== -1) clearTimeout(actArb.timer);
     } catch (_) {}
     actArb.timer = 0;
     actArb.busyUntil = 0;
@@ -544,8 +1376,11 @@
       const sp = wrap.querySelector ? wrap.querySelector(CFG.READY_SPAN_SEL) : null;
       const a = norm(sp ? safeAttr(sp, "title") : "");
       const b = norm(sp ? (sp.textContent || "") : (wrap.textContent || ""));
-      if (CFG.RE_READY.test(a) || CFG.RE_READY.test(b) || textLooksLike(a, CFG.TOK_READY) || textLooksLike(b, CFG.TOK_READY)) return "ready";
-      if (CFG.RE_ZERO.test(a)  || CFG.RE_ZERO.test(b)  || textLooksLike(a, CFG.TOK_ZERO)  || textLooksLike(b, CFG.TOK_ZERO))  return "zero";
+
+      if (CFG.RE_READY.test(a) || CFG.RE_READY.test(b)) return "ready";
+      if (CFG.RE_ZERO.test(a)  || CFG.RE_ZERO.test(b))  return "zero";
+      if (textLooksLike(a, CFG.TOK_READY) || textLooksLike(b, CFG.TOK_READY)) return "ready";
+      if (textLooksLike(a, CFG.TOK_ZERO)  || textLooksLike(b, CFG.TOK_ZERO))  return "zero";
       return "none";
     } catch (_) { return "none"; }
   };
@@ -568,9 +1403,17 @@
     try {
       if (!wrap) return null;
       const btn = wrap.querySelector?.("button,[role='button'],a[href]");
-      if (btn && isVisible(btn)) return btn;
+      if (btn && isVisible(btn)) {
+        if (CFG.INTERSECT_ENABLE) visibilityTracker.track(btn);
+        if (CFG.TURBO_CLICK_ENABLE) turboClick.warm(btn);
+        return btn;
+      }
       const sp = wrap.querySelector?.(CFG.READY_SPAN_SEL);
-      if (sp && isVisible(sp)) return sp;
+      if (sp && isVisible(sp)) {
+        if (CFG.INTERSECT_ENABLE) visibilityTracker.track(sp);
+        if (CFG.TURBO_CLICK_ENABLE) turboClick.warm(sp);
+        return sp;
+      }
       return wrap;
     } catch (_) { return wrap; }
   };
@@ -587,9 +1430,12 @@
       const down = { ...base, button:0, buttons:1 };
       const up   = { ...base, button:0, buttons:0 };
 
+      try { target.focus({ preventScroll: true }); } catch (_) {}
+
       dispatchMouseLike(target, "pointerover",  { ...base, pointerType:pt, isPrimary:true, pointerId:1 });
       dispatchMouseLike(target, "pointerenter", { ...base, pointerType:pt, isPrimary:true, pointerId:1 });
       dispatchMouseLike(target, "mouseover", base);
+      dispatchMouseLike(target, "mouseenter", base);
       dispatchMouseLike(target, "pointerdown", { ...down, pointerType:pt, isPrimary:true, pointerId:1 });
       dispatchMouseLike(target, "mousedown", down);
       dispatchMouseLike(target, "pointerup", { ...up, pointerType:pt, isPrimary:true, pointerId:1 });
@@ -617,8 +1463,13 @@
         }
       }
       const okFallback = fireSequence(target);
-      if (okFallback && statFallbackKey) STATS[statFallbackKey] = (STATS[statFallbackKey] || 0) + 1;
-      return okFallback;
+      if (okFallback) {
+        if (statFallbackKey) STATS[statFallbackKey] = (STATS[statFallbackKey] || 0) + 1;
+        return true;
+      }
+
+      try { target.click(); return true; } catch (__) {}
+      return false;
     } catch (_) { return false; }
   };
 
@@ -635,7 +1486,16 @@
       const vw = w.innerWidth || 0;
       const vh = w.innerHeight || 0;
       if (!(cx >= 0 && cy >= 0 && cx <= vw && cy <= vh)) return false;
-      return elementFromPointOK(el, cx, cy);
+
+      const ok = elementFromPointOK(el, cx, cy);
+      if (!ok) {
+
+        if (CFG.ADAPTIVE_ENABLE && now() < adaptive.ultraUntil) {
+          STATS.serveTopmostBypass++;
+          return true;
+        }
+      }
+      return ok;
     } catch (_) { return true; }
   };
 
@@ -675,7 +1535,7 @@
       if (prev === "ready" && st !== "ready") { armedReady.set(wrap, true); clearAttempts(wrap, "ready"); }
       if (prev === "zero"  && st !== "zero")  { armedZero.set(wrap, true);  clearAttempts(wrap, "zero"); }
 
-      if (st === "ready") resetAttempts(wrap, "ready");
+      if (st === "ready") { resetAttempts(wrap, "ready"); serveDetectedAt = now(); }
       if (st === "zero")  resetAttempts(wrap, "zero");
 
       if (st === "none") {
@@ -711,7 +1571,7 @@
         if (st === "ready") armedReady.set(wrap, true);
         if (st === "zero")  armedZero.set(wrap, true);
 
-        scheduleBurst(CFG.RETRY_BURST_MS);
+        scheduleBurst(smartRetry.getDelay(attempts, CFG.RETRY_BURST_MS));
       } catch (_) {}
     }, delay);
   };
@@ -726,6 +1586,9 @@
     if (getWrapState(wrap) !== st) return false;
 
     const t = now();
+
+    if (t < serveClaimLockUntil) return false;
+    if (CFG.MULTI_TAB_ENABLE && !multiTab.canServe()) return false;
 
     if (st === "zero") {
       if (!CFG.CLICK_ON_ZERO) return false;
@@ -754,7 +1617,7 @@
     }
 
     map.set(wrap, t);
-    clickTimes.push(t);
+    ringPush(t);
     lastGlobalClickAt = t;
 
     if (st === "ready") armedReady.set(wrap, false);
@@ -762,9 +1625,28 @@
 
     bumpAttempt(wrap, st);
     STATS.serveClicked += 1;
+    STATS.lastServeAt = t;
+    health.lastActivityAt = t;
 
-    const ok = runClickPipeline(tgt, CFG.S1_NATIVE_CLICK_FIRST, "serveNativeClick", "serveFallbackClick");
-    try { if (ok && st === "ready") asArmServeToken(); } catch (_) {}
+    if (st === "ready") {
+      recordServeLatency();
+      adaptiveOnServe();
+    }
+
+    let ok = false;
+    if (CFG.TURBO_CLICK_ENABLE) {
+      try { ok = turboClick.fireWithCache(tgt); } catch (_) {}
+    }
+    if (!ok) {
+      ok = runClickPipeline(tgt, CFG.S1_NATIVE_CLICK_FIRST, "serveNativeClick", "serveFallbackClick");
+    }
+
+    if (ok && st === "ready") {
+      try { asArmServeToken(); } catch (_) {}
+      try { if (CFG.MULTI_TAB_ENABLE) multiTab.claimServe(); } catch (_) {}
+      try { if (CFG.PREDICT_ENABLE) predict.onServe(); } catch (_) {}
+      try { if (CFG.AUDIO_ON_SERVE) audio.onServe(); } catch (_) {}
+    }
 
     postClickVerify(wrap, st, GEN);
     return ok;
@@ -796,12 +1678,17 @@
         }
 
         const t = now();
-        if ((t - lastMoBurstAt) < CFG.MO_BURST_THROTTLE_MS) return;
+        if (CFG.MO_BURST_THROTTLE_MS > 0 && (t - lastMoBurstAt) < CFG.MO_BURST_THROTTLE_MS) return;
         lastMoBurstAt = t;
 
         const st = getWrapState(wrap);
         rearmIfNeeded(wrap, st);
-        if (st !== "none") smartClick(wrap, st);
+
+        if (st === "ready" && canAct("ready")) {
+          smartClickExec(wrap, st);
+        } else if (st !== "none") {
+          smartClick(wrap, st);
+        }
 
         scheduleBurst();
       } catch (_) {}
@@ -833,7 +1720,7 @@
 
     try { rearmIfNeeded(wrap, st); } catch (_) {}
     let clicked = false;
-    try { if (st !== "none") clicked = smartClick(wrap, st); } catch (_) {}
+    try { if (st !== "none") clicked = !!smartClick(wrap, st); } catch (_) {}
 
     return { st, clicked };
   };
@@ -844,11 +1731,13 @@
       if (wrapsSet.has(wrap)) return;
       wrapsSet.add(wrap);
       wrapsList.push(wrap);
+      if (CFG.INTERSECT_ENABLE) visibilityTracker.track(wrap);
+      if (CFG.TURBO_CLICK_ENABLE) turboClick.warm(wrap);
       registerWrap(wrap);
     } catch (_) {}
   };
 
-  const pruneWrapsList = (force=false) => {
+  const pruneWrapsList = (force = false) => {
     const t = now();
     if (!force && (t - wrapsPruneAt) < CFG.WRAP_PRUNE_EVERY_MS) return;
     wrapsPruneAt = t;
@@ -863,10 +1752,7 @@
         continue;
       }
 
-      try {
-        const mo = wrapLocalMO.get(w);
-        if (mo) mo.disconnect();
-      } catch (_) {}
+      try { const mo = wrapLocalMO.get(w); if (mo) mo.disconnect(); } catch (_) {}
       try { wrapLocalMO.delete(w); } catch (_) {}
       try { lastState.delete(w); } catch (_) {}
       try { armedReady.delete(w); } catch (_) {}
@@ -875,12 +1761,14 @@
       try { clickedAtZero.delete(w); } catch (_) {}
       try { readyAttempts.delete(w); } catch (_) {}
       try { zeroAttempts.delete(w); } catch (_) {}
+      try { wrapsSet.delete(w); } catch (_) {}
+      try { if (CFG.INTERSECT_ENABLE) visibilityTracker.untrack(w); } catch (_) {}
     }
 
     wrapsList.length = write;
   };
 
-  const resyncWraps = (force=false) => {
+  const resyncWraps = (force = false) => {
     const t = now();
     if (!force && (t - wrapsResyncAt) < CFG.WRAP_RESYNC_MS) return;
     wrapsResyncAt = t;
@@ -911,15 +1799,14 @@
       const w = el.ownerDocument?.defaultView || window;
       const cs = w.getComputedStyle(el);
       if (!cs) return false;
-      if (cs.display === "none" || cs.visibility === "hidden") return false;
-      return true;
+      return cs.display !== "none" && cs.visibility !== "hidden";
     } catch (_) { return false; }
   };
 
   const visSignal = (ms = CFG.VIS_WAKE_BURST_MS, hard = false) => {
     const t = now();
     visLastVisitorSignalAt = t;
-    if ((t - visLastWakeAt) < 36 && !hard) return;
+    if ((t - visLastWakeAt) < 20 && !hard) return;
     visLastWakeAt = t;
     scheduleBurst(hard ? Math.max(ms, CFG.VIS_HARD_WAKE_BURST_MS) : ms);
   };
@@ -1006,14 +1893,16 @@
   const visKick = (hard = false) => {
     if (!CFG.VIS_ENABLE || !on) return;
     visLastMutAt = now();
-    microtask(() => {
+    fastMicrotask(() => {
       try { if (on) visScanAll(hard); } catch (_) {}
     });
     visPlanNext();
   };
 
   const scanAndRegister = () => {
-    if (!on) return { found:false, clicked:false };
+    if (!on) return { found: false, clicked: false };
+
+    _visCacheGen++;
 
     resyncWraps(false);
     pruneWrapsList(false);
@@ -1030,7 +1919,10 @@
       if (st !== "none") found = true;
       if (st !== "ready") continue;
       const r = registerWrap(w, st);
-      if (r.clicked) { clicked = true; if (CFG.STOP_SCAN_AFTER_CLICK) return { found, clicked }; }
+      if (r.clicked) {
+        clicked = true;
+        if (CFG.STOP_SCAN_AFTER_CLICK) return { found, clicked };
+      }
     }
 
     if (CFG.CLICK_ON_ZERO) {
@@ -1041,7 +1933,10 @@
         if (st !== "none") found = true;
         if (st !== "zero") continue;
         const r = registerWrap(w, st);
-        if (r.clicked) { clicked = true; if (CFG.STOP_SCAN_AFTER_CLICK) break; }
+        if (r.clicked) {
+          clicked = true;
+          if (CFG.STOP_SCAN_AFTER_CLICK) break;
+        }
       }
     }
 
@@ -1073,9 +1968,11 @@
 
     if (lastFrameAt) {
       const dt = t - lastFrameAt;
-      if (dt > 70) jankScore++; else jankScore = Math.max(0, jankScore - 1);
-      if (jankScore >= 6) {
-        ecoUntil = t + 4200;
+      if (dt > CFG.JANK_THRESHOLD_MS) jankScore++;
+      else jankScore = Math.max(0, jankScore - CFG.JANK_DECAY_RATE);
+
+      if (jankScore >= CFG.JANK_SCORE_LIMIT) {
+        ecoUntil = t + CFG.JANK_ECO_DURATION_MS;
         jankScore = 0;
         rafId = 0;
         hotTimer = 0;
@@ -1103,14 +2000,15 @@
       if (!canServeEngineRun()) { wakeIfNeeded(); return; }
       if (pendingBurst) {
         pendingBurst = false;
-        scheduleBurst(420);
+        scheduleBurst(300);
       }
-    }, 140);
+    }, 80);
   }
 
   function scheduleBurst(ms = CFG.BURST_MS) {
     if (!on) return;
 
+    STATS.totalBursts++;
     const t = now();
     burstUntil = Math.max(burstUntil, t + ms);
     burstHotUntil = Math.max(burstHotUntil, t + CFG.HOT_BURST_FIRST_MS);
@@ -1185,7 +2083,7 @@
 
       rootMOs.push(mo);
       resyncWraps(true);
-      scheduleBurst(900);
+      scheduleBurst(600);
     } catch (_) {}
   };
 
@@ -1201,7 +2099,7 @@
           const w = f.contentWindow;
           if (d) wireRoot(d);
           if (w) bindShortcut(w);
-          scheduleBurst(900);
+          scheduleBurst(600);
           cbKick();
           visKick(true);
           asKick("frame");
@@ -1244,180 +2142,39 @@
     shortcutBinds.length = 0;
   };
 
-  const POS_KEY = "s1_puck_pos_v1";
+  const healthCheck = () => {
+    if (!CFG.HEALTH_ENABLE || !on) return;
 
-  const updateUI = () => {
-    const d = document.getElementById(UI.PANEL_ID);
-    if (!d) return;
-    d.classList.toggle("off", !on);
-    d.title = `${META.NAME} ${META.VERSION} - ${on ? "Active" : "Off"}\nCtrl+Enter : On/Off\nShift+Tap Bubble : Remove`;
+    const t = now();
+    health.lastCheckAt = t;
+
+    const sinceActivity = t - health.lastActivityAt;
+    if (sinceActivity > CFG.HEALTH_STALE_THRESHOLD_MS && health.recoverAttempts < CFG.HEALTH_MAX_RECOVER_ATTEMPTS) {
+      health.recoverAttempts++;
+      STATS.healthRecoveries++;
+
+      resyncWraps(true);
+      scheduleBurst(CFG.BURST_MS);
+      cbKick();
+      visKick(true);
+      asKick("health");
+    }
+
+    if (sinceActivity < 3000) {
+      health.recoverAttempts = 0;
+    }
   };
 
-  const buildUI = () => {
-    if (!document.getElementById(UI.STYLE_ID)) {
-      const s = document.createElement("style");
-      s.id = UI.STYLE_ID;
-      s.textContent = `
-#${UI.PANEL_ID}{
-  position:fixed; z-index:2147483647;
-  left:0; top:0; right:auto; bottom:auto;
-  width:42px; height:42px;
-  display:inline-flex; align-items:center; justify-content:center;
-  border-radius:9999px; cursor:pointer;
-  box-shadow: 0 10px 26px rgba(0,0,0,.34),
-              inset 0 1px 0 rgba(255,255,255,.12),
-              inset 0 -1px 0 rgba(0,0,0,.22);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
-  transition: opacity .16s ease, transform .05s linear;
-  background: linear-gradient(145deg, rgba(36,36,36,.90), rgba(10,10,10,.72));
-  touch-action:none;
-  -webkit-user-select:none; user-select:none;
-  -webkit-tap-highlight-color: transparent;
-  will-change: transform;
-  contain: layout paint style;
-}
-#${UI.PANEL_ID}.off{ opacity:.45; }
-#${UI.PANEL_ID}:active{ filter: brightness(1.03); }
-#${UI.PANEL_ID} .logo{ width:24px; height:24px; pointer-events:none; filter: drop-shadow(0 1px 2px rgba(0,0,0,.3)); }
-@media (prefers-color-scheme: light){
-  #${UI.PANEL_ID}{ background: linear-gradient(145deg, rgba(255,255,255,.95), rgba(240,240,240,.80)); }
-}`.trim();
-      (document.head || document.documentElement).appendChild(s);
-    }
+  const healthStart = () => {
+    if (!CFG.HEALTH_ENABLE) return;
+    health.lastActivityAt = now();
+    if (health.timer) clearInterval(health.timer);
+    health.timer = setInterval(healthCheck, CFG.HEALTH_CHECK_MS);
+  };
 
-    let d = document.getElementById(UI.PANEL_ID);
-    if (!d) {
-      d = document.createElement("div");
-      d.id = UI.PANEL_ID;
-
-      const NS = "http://www.w3.org/2000/svg";
-      const svg = document.createElementNS(NS, "svg");
-      svg.setAttribute("viewBox", "0 -30.5 256 256");
-      svg.setAttribute("class", "logo");
-      svg.setAttribute("preserveAspectRatio", "xMidYMid");
-      const g = document.createElementNS(NS, "g");
-      const p = document.createElementNS(NS, "path");
-      p.setAttribute("d",
-        "M118.249172,51.2326115 L118.249172,194.005605 L0,194.005605 L118.249172,51.2326115 Z "+
-        "M118.249172,0 C118.249172,32.6440764 91.7686624,59.124586 59.124586,59.124586 "+
-        "C26.4805096,59.124586 0,32.6440764 0,0 L118.249172,0 Z "+
-        "M137.750828,194.005605 C137.750828,161.328917 164.198726,134.881019 196.875414,134.881019 "+
-        "C229.552102,134.881019 256,161.361529 256,194.005605 L137.750828,194.005605 Z "+
-        "M137.750828,142.740382 L137.750828,0 L256,0 L137.750828,142.740382 Z"
-      );
-      p.setAttribute("fill", "#03363D");
-      g.appendChild(p);
-      svg.appendChild(g);
-      d.appendChild(svg);
-
-      let x = 0, y = 0, w = 42, h = 42;
-      let drag = false, moved = false;
-      let startCX = 0, startCY = 0, startX = 0, startY = 0;
-      let rafPos = 0, dirty = false;
-      let capId = null;
-
-      const clamp = (vx, vy) => {
-        const vw = innerWidth || 0, vh = innerHeight || 0;
-        const pad = 6;
-        const cx = Math.min(Math.max(pad, vx), Math.max(pad, vw - w - pad));
-        const cy = Math.min(Math.max(pad, vy), Math.max(pad, vh - h - pad));
-        return [cx, cy];
-      };
-
-      const applyPos = () => {
-        rafPos = 0;
-        if (!dirty) return;
-        dirty = false;
-        d.style.transform = `translate3d(${x}px,${y}px,0)`;
-      };
-
-      const setPos = (vx, vy) => {
-        const c = clamp(vx, vy);
-        x = c[0]; y = c[1];
-        dirty = true;
-        if (!rafPos) rafPos = requestAnimationFrame(applyPos);
-      };
-
-      const loadPos = () => {
-        try {
-          const raw = localStorage.getItem(POS_KEY);
-          if (raw) {
-            const j = JSON.parse(raw);
-            if (j && Number.isFinite(j.x) && Number.isFinite(j.y)) {
-              x = j.x; y = j.y;
-              dirty = true;
-              applyPos();
-              return;
-            }
-          }
-        } catch (_) {}
-        x = Math.max(6, (innerWidth || 0) - 14 - 42);
-        y = Math.max(6, (innerHeight || 0) - 14 - 42);
-        dirty = true;
-        applyPos();
-      };
-
-      const savePos = () => { try { localStorage.setItem(POS_KEY, JSON.stringify({ x, y })); } catch (_) {} };
-
-      const refreshSize = () => {
-        try {
-          const r = d.getBoundingClientRect();
-          if (r && r.width > 0 && r.height > 0) { w = r.width; h = r.height; }
-        } catch (_) {}
-      };
-
-      loadPos();
-      refreshSize();
-
-      const onResize = () => { refreshSize(); setPos(x, y); };
-      uiRM.resize = onResize;
-      addEventListener("resize", onResize, { passive: true });
-
-      d.onpointerdown = (e) => {
-        try {
-          drag = true; moved = false;
-          refreshSize();
-          startCX = e.clientX; startCY = e.clientY;
-          startX = x; startY = y;
-          capId = e.pointerId;
-          try { d.setPointerCapture(e.pointerId); } catch (_) {}
-          if (e.cancelable) { try { e.preventDefault(); } catch (_) {} }
-        } catch (_) {}
-      };
-
-      d.onpointermove = (e) => {
-        if (!drag) return;
-        try {
-          const dx = e.clientX - startCX;
-          const dy = e.clientY - startCY;
-          if (Math.abs(dx) + Math.abs(dy) > 4) moved = true;
-          setPos(startX + dx, startY + dy);
-          if (e.cancelable) { try { e.preventDefault(); } catch (_) {} }
-        } catch (_) {}
-      };
-
-      const endDrag = () => {
-        drag = false;
-        try { if (capId != null) d.releasePointerCapture(capId); } catch (_) {}
-        capId = null;
-        savePos();
-      };
-
-      d.onpointerup = endDrag;
-      d.onpointercancel = endDrag;
-      d.onlostpointercapture = endDrag;
-
-      d.onclick = (e) => {
-        if (moved) { moved = false; return; }
-        if (e && e.shiftKey) { kill(); return; }
-        toggle();
-      };
-
-      (document.body || document.documentElement).appendChild(d);
-    }
-
-    updateUI();
+  const healthStop = () => {
+    if (health.timer) clearInterval(health.timer);
+    health.timer = 0;
   };
 
   const cbState = new WeakMap();
@@ -1429,8 +2186,10 @@
   let cbLastScanAt = 0;
   let cbLastOpenAt = 0;
 
-  const cbCloseTimes = [];
-  let cbCloseHead = 0;
+  const CB_CLOSE_RING_SIZE = 64;
+  const cbCloseRing = new Float64Array(CB_CLOSE_RING_SIZE);
+  let cbCloseRingHead = 0;
+  let cbCloseRingTail = 0;
   let cbLastCloseAt = 0;
 
   const cbPendingOpen = new WeakMap();
@@ -1517,7 +2276,6 @@
       if (!CFG.CB_IGNORE_AGENT_ITEMS) return false;
       if (!item || item.nodeType !== 1) return false;
       if (item.classList?.contains(CFG.CB_AGENT_CLASS)) return true;
-
       const rowid = safeAttr(item, "jx:list:rowid") || safeAttr(item, "jx:list:rowId") || safeAttr(item, "data-rowid");
       if (rowid && String(rowid).toLowerCase().startsWith(String(CFG.CB_AGENT_ROWID_PREFIX).toLowerCase())) return true;
       return false;
@@ -1538,10 +2296,7 @@
       const w = el.ownerDocument?.defaultView || window;
       const cs = w.getComputedStyle(el);
       if (!cs) return false;
-      if (cs.display === "none") return false;
-      if (cs.visibility === "hidden") return false;
-      if (+cs.opacity === 0) return false;
-      return true;
+      return cs.display !== "none" && cs.visibility !== "hidden" && +cs.opacity !== 0;
     } catch (_) {
       const st = (el.getAttribute("style") || "").toLowerCase();
       return st.includes("visibility: visible") || st.includes("visibility:visible");
@@ -1552,8 +2307,7 @@
     try {
       if (item.classList?.contains("active")) return true;
       const aria = safeAttr(item, "aria-selected");
-      if (aria && aria.toLowerCase() === "true") return true;
-      return false;
+      return aria === "true";
     } catch (_) { return false; }
   };
 
@@ -1565,6 +2319,18 @@
       return !!(t && CFG.CB_LEAVE_TEXT_RE.test(t));
     } catch (_) { return false; }
   };
+
+  function asHasPriorityLock() {
+    try {
+      if (!CFG.AS_ENABLE) return false;
+      const t = now();
+      if (asFlow.key) return true;
+      if (asServe.armed && !asServeTokenExpired()) return true;
+      if (asFlow.lastSendAt && (t - asFlow.lastSendAt) < Math.max(CFG.AS_SEND_LOCK_MS, CFG.AS_SEND_VERIFY_MS)) return true;
+      if (asServe.sendAt && (t - asServe.sendAt) < Math.max(CFG.AS_SEND_VERIFY_MS, 450)) return true;
+      return false;
+    } catch (_) { return false; }
+  }
 
   const cbCanOpen = (reason) => {
     if (!on) return false;
@@ -1585,7 +2351,7 @@
       const w = el.ownerDocument?.defaultView || window;
       const vh = w.innerHeight || 0;
       if (r.top < 0 || r.bottom > vh) {
-        try { el.scrollIntoView({ block: "nearest", inline: "nearest" }); } catch (_) {}
+        try { el.scrollIntoView({ block: "nearest", inline: "nearest", behavior: "instant" }); } catch (_) {}
       }
     } catch (_) {}
   };
@@ -1607,13 +2373,11 @@
   const cbFireItemClick = (item) => {
     try {
       if (!item) return false;
-
       const w = item.ownerDocument?.defaultView || window;
       const pt = ("ontouchstart" in w) ? "touch" : "mouse";
       const r = item.getBoundingClientRect();
       const cx = r.left + r.width * CFG.CB_CLICK_X_RATIO;
       const cy = r.top + r.height * CFG.CB_CLICK_Y_RATIO;
-
       const base = { bubbles:true, cancelable:true, view:w, clientX:cx, clientY:cy, composed:true };
       const down = { ...base, button:0, buttons:1 };
       const up   = { ...base, button:0, buttons:0 };
@@ -1630,35 +2394,32 @@
     }
   };
 
-  const cbPruneCloses = (t) => {
-    while (cbCloseHead < cbCloseTimes.length && (t - cbCloseTimes[cbCloseHead]) > CFG.CB_CLOSE_WINDOW_MS) cbCloseHead++;
-    if (cbCloseHead > 24 && cbCloseHead * 2 > cbCloseTimes.length) {
-      cbCloseTimes.splice(0, cbCloseHead);
-      cbCloseHead = 0;
-    }
+  const cbCloseRingCount = () => {
+    if (cbCloseRingTail >= cbCloseRingHead) return cbCloseRingTail - cbCloseRingHead;
+    return CB_CLOSE_RING_SIZE - cbCloseRingHead + cbCloseRingTail;
   };
 
   const cbCloseThrottleOK = (t) => {
-    cbPruneCloses(t);
-    const live = cbCloseTimes.length - cbCloseHead;
-    if (live >= CFG.CB_CLOSE_MAX_PER_WINDOW) return false;
+
+    while (cbCloseRingHead !== cbCloseRingTail && (t - cbCloseRing[cbCloseRingHead]) > CFG.CB_CLOSE_WINDOW_MS) {
+      cbCloseRingHead = (cbCloseRingHead + 1) % CB_CLOSE_RING_SIZE;
+    }
+    if (cbCloseRingCount() >= CFG.CB_CLOSE_MAX_PER_WINDOW) return false;
     if ((t - cbLastCloseAt) < CFG.CB_CLOSE_COOLDOWN_MS) return false;
     return true;
   };
 
   const cbOpenThrottleOK = (t) => {
-    if ((t - cbLastOpenAt) < CFG.CB_OPEN_COOLDOWN_MS) return false;
-    return true;
+    return (t - cbLastOpenAt) >= CFG.CB_OPEN_COOLDOWN_MS;
   };
 
   const cbScheduleOpen = (item, reason) => {
     try {
       const t = now();
       const p = cbPendingOpen.get(item) || 0;
-      if ((t - p) < 25) return;
+      if ((t - p) < 20) return;
       cbPendingOpen.set(item, t);
-
-      microtask(() => {
+      fastMicrotask(() => {
         try { cbOpenIfAllowed(item, reason); } catch (_) {}
       });
     } catch (_) {}
@@ -1697,6 +2458,7 @@
     cbState.set(item, s);
 
     STATS.cbOpenClicked += 1;
+    health.lastActivityAt = t;
     const ok = runClickPipeline(item, CFG.CB_NATIVE_CLICK_FIRST, null, null) || cbFireItemClick(item);
     cbPostClickLockUntil.set(item, t + CFG.CB_POST_CLICK_LOCK_MS);
     if (ok) asKick("open");
@@ -1739,7 +2501,8 @@
     cbEnsureInView(closeBtn);
 
     cbLastCloseAt = t;
-    cbCloseTimes.push(t);
+    cbCloseRing[cbCloseRingTail] = t;
+    cbCloseRingTail = (cbCloseRingTail + 1) % CB_CLOSE_RING_SIZE;
 
     s.lastCloseAt = t;
     cbState.set(item, s);
@@ -1768,7 +2531,6 @@
     for (let i = 0; i < n; i++) {
       const it = items[i];
       if (!it || it.nodeType !== 1) continue;
-
       if (cbIsAgentItem(it)) continue;
 
       const s = cbState.get(it);
@@ -1804,8 +2566,8 @@
       const active = cbGetActive(item);
       const leave = cbGetLeave(item);
 
-      const unreadUp = unread > prev.unread;
       const becameUnread = prev.unread === 0 && unread > 0;
+      const unreadUp = unread > prev.unread;
       const leaveUp = !prev.leave && leave;
 
       const next = { ...prev, unread, loading, active, leave, isAgent };
@@ -1852,8 +2614,7 @@
         const it = items[i];
         if (!it) continue;
         if (cbIsAgentItem(it)) continue;
-        const unread = cbGetUnread(it);
-        if (unread > 0) return true;
+        if (cbGetUnread(it) > 0) return true;
       }
       return false;
     } catch (_) { return true; }
@@ -1865,7 +2626,7 @@
       if (cbScanTimer) return;
 
       if (userDown || isComposerBusy()) {
-        cbScanTimer = setTimeout(() => { cbScanTimer = 0; cbPlanNextScan(); }, 260);
+        cbScanTimer = setTimeout(() => { cbScanTimer = 0; cbPlanNextScan(); }, 160);
         return;
       }
 
@@ -1894,7 +2655,7 @@
     try {
       if (!on) return;
       cbLastMutAt = now();
-      microtask(() => {
+      fastMicrotask(() => {
         try {
           if (!on) return;
           if (userDown || isComposerBusy()) return;
@@ -1974,10 +2735,8 @@ ${CFG.CB_ITEM_SEL}.${CFG.CB_LEAVE_CLASS}{ filter: grayscale(.25) contrast(0.95);
   const cbUnwire = () => {
     try { if (cbRootMO) cbRootMO.disconnect(); } catch (_) {}
     cbRootMO = null;
-
     try { if (cbScanTimer) clearTimeout(cbScanTimer); } catch (_) {}
     cbScanTimer = 0;
-
     try { const s = document.getElementById(UI.CB_STYLE_ID); if (s) s.remove(); } catch (_) {}
   };
 
@@ -2044,11 +2803,9 @@ ${CFG.CB_ITEM_SEL}.${CFG.CB_LEAVE_CLASS}{ filter: grayscale(.25) contrast(0.95);
   const visUnwire = () => {
     try { if (visRootMO) visRootMO.disconnect(); } catch (_) {}
     visRootMO = null;
-
     try { if (visScanTimer) clearTimeout(visScanTimer); } catch (_) {}
     visScanTimer = 0;
   };
-
 
   const asQS = (root, sel) => { try { return root?.querySelector?.(sel) || null; } catch (_) { return null; } };
 
@@ -2078,29 +2835,45 @@ ${CFG.CB_ITEM_SEL}.${CFG.CB_LEAVE_CLASS}{ filter: grayscale(.25) contrast(0.95);
     try {
       const w = ta.ownerDocument?.defaultView || window;
       const next = String(value || "");
+
       const proto = Object.getPrototypeOf(ta);
       const desc = proto && Object.getOwnPropertyDescriptor(proto, "value");
       if (desc && typeof desc.set === "function") desc.set.call(ta, next);
       else ta.value = next;
+
       try {
         if (typeof ta.setSelectionRange === "function") ta.setSelectionRange(next.length, next.length);
       } catch (_) {}
+
       try {
-        ta.dispatchEvent(new w.InputEvent("beforeinput", { bubbles: true, cancelable: true, composed: true, data: next.slice(-1) || null, inputType: "insertText" }));
+        ta.dispatchEvent(new w.InputEvent("beforeinput", {
+          bubbles: true, cancelable: true, composed: true,
+          data: next.slice(-1) || null, inputType: "insertText"
+        }));
       } catch (_) {}
+
       try {
-        ta.dispatchEvent(new w.InputEvent("input", { bubbles: true, composed: true, data: next.slice(-1) || null, inputType: "insertText" }));
+        ta.dispatchEvent(new w.InputEvent("input", {
+          bubbles: true, composed: true,
+          data: next.slice(-1) || null, inputType: "insertText"
+        }));
       } catch (_) {
         ta.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
       }
+
       ta.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+
+      try {
+        const reactKey = Object.keys(ta).find(k => k.startsWith("__reactProps$") || k.startsWith("__reactEventHandlers$"));
+        if (reactKey && ta[reactKey]?.onChange) {
+          ta[reactKey].onChange({ target: ta, currentTarget: ta });
+        }
+      } catch (_) {}
+
       return true;
     } catch (_) {
       try {
         ta.value = String(value || "");
-        try {
-          if (typeof ta.setSelectionRange === "function") ta.setSelectionRange(ta.value.length, ta.value.length);
-        } catch (_) {}
         ta.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
         return true;
       } catch (__) { return false; }
@@ -2111,7 +2884,10 @@ ${CFG.CB_ITEM_SEL}.${CFG.CB_LEAVE_CLASS}{ filter: grayscale(.25) contrast(0.95);
     try {
       const w = el.ownerDocument?.defaultView || window;
       const kc = key === "Enter" ? 13 : (typeof key === "string" && key.length === 1 ? key.toUpperCase().charCodeAt(0) : 0);
-      const init = { key, code, bubbles: true, cancelable: true, composed: true, keyCode: kc || undefined, which: kc || undefined, charCode: kc || undefined };
+      const init = {
+        key, code, bubbles: true, cancelable: true, composed: true,
+        keyCode: kc || undefined, which: kc || undefined, charCode: kc || undefined
+      };
       el.dispatchEvent(new w.KeyboardEvent("keydown", init));
       el.dispatchEvent(new w.KeyboardEvent("keypress", init));
       return true;
@@ -2146,7 +2922,10 @@ ${CFG.CB_ITEM_SEL}.${CFG.CB_LEAVE_CLASS}{ filter: grayscale(.25) contrast(0.95);
         asDispatchInputValue(ta, acc);
         try {
           const w = ta.ownerDocument?.defaultView || window;
-          ta.dispatchEvent(new w.KeyboardEvent("keyup", { key: meta.key, code: meta.code, bubbles: true, cancelable: true, composed: true }));
+          ta.dispatchEvent(new w.KeyboardEvent("keyup", {
+            key: meta.key, code: meta.code,
+            bubbles: true, cancelable: true, composed: true
+          }));
         } catch (_) {}
       }
       return norm(ta.value) === norm(raw);
@@ -2202,6 +2981,30 @@ ${CFG.CB_ITEM_SEL}.${CFG.CB_LEAVE_CLASS}{ filter: grayscale(.25) contrast(0.95);
     catch (_) { return ""; }
   };
 
+  const pruneOrderedSet = (set, max) => {
+    try {
+      if (!set || set.size <= max) return;
+      const iter = set.values();
+      while (set.size > max) {
+        const first = iter.next();
+        if (first?.done) break;
+        set.delete(first.value);
+      }
+    } catch (_) {}
+  };
+
+  const pruneOrderedMap = (map, max) => {
+    try {
+      if (!map || map.size <= max) return;
+      const iter = map.keys();
+      while (map.size > max) {
+        const first = iter.next();
+        if (first?.done) break;
+        map.delete(first.value);
+      }
+    } catch (_) {}
+  };
+
   const asRememberProof = (key, proof) => {
     try {
       const k = String(key || "");
@@ -2216,29 +3019,6 @@ ${CFG.CB_ITEM_SEL}.${CFG.CB_LEAVE_CLASS}{ filter: grayscale(.25) contrast(0.95);
   const asGetProof = (key) => {
     try { return asProofByKey.get(String(key || "")) || ""; }
     catch (_) { return ""; }
-  };
-
-
-  const pruneOrderedSet = (set, max) => {
-    try {
-      if (!set || set.size <= max) return;
-      while (set.size > max) {
-        const first = set.values().next();
-        if (first?.done) break;
-        set.delete(first.value);
-      }
-    } catch (_) {}
-  };
-
-  const pruneOrderedMap = (map, max) => {
-    try {
-      if (!map || map.size <= max) return;
-      while (map.size > max) {
-        const first = map.keys().next();
-        if (first?.done) break;
-        map.delete(first.value);
-      }
-    } catch (_) {}
   };
 
   const asRememberSent = (key) => {
@@ -2524,7 +3304,11 @@ ${CFG.CB_ITEM_SEL}.${CFG.CB_LEAVE_CLASS}{ filter: grayscale(.25) contrast(0.95);
     const ok = asDispatchKey(ta, "Enter", "Enter");
     try {
       const w = ta.ownerDocument?.defaultView || window;
-      ta.dispatchEvent(new w.KeyboardEvent("keyup", { key: "Enter", code: "Enter", bubbles: true, cancelable: true, composed: true, keyCode: 13, which: 13, charCode: 13 }));
+      ta.dispatchEvent(new w.KeyboardEvent("keyup", {
+        key: "Enter", code: "Enter",
+        bubbles: true, cancelable: true, composed: true,
+        keyCode: 13, which: 13, charCode: 13
+      }));
     } catch (_) {}
     return ok;
   };
@@ -2538,7 +3322,7 @@ ${CFG.CB_ITEM_SEL}.${CFG.CB_LEAVE_CLASS}{ filter: grayscale(.25) contrast(0.95);
         asTimer = setTimeout(() => {
           asTimer = 0;
           asLoop();
-        }, 30);
+        }, 15);
       }
     } catch (_) {}
   };
@@ -2812,7 +3596,7 @@ ${CFG.CB_ITEM_SEL}.${CFG.CB_LEAVE_CLASS}{ filter: grayscale(.25) contrast(0.95);
     const onUp   = (e) => { if (!e?.isTrusted) return; if (isPuck(e.target)) return; userDown = false; markUserBusy(CFG.USER_GRACE_AFTER_UP_MS); };
     const onWheel= (e) => { if (!e?.isTrusted) return; if (isPuck(e.target)) return; if (isChatbarTarget(e.target) || isActivePanelTarget(e.target)) cbTouchManualTarget(CFG.CB_MANUAL_PANEL_HOLD_MS); markUserBusy(CFG.USER_GRACE_ON_WHEEL_MS); };
     const onKey  = (e) => { if (!e?.isTrusted) return; if (isActivePanelTarget(e.target)) cbTouchManualTarget(CFG.CB_MANUAL_PANEL_HOLD_MS); markUserBusy(CFG.USER_GRACE_ON_KEY_MS); };
-    const onBlur = () => { try { userDown = false; markUserBusy(140); } catch (_) {} };
+    const onBlur = () => { try { userDown = false; markUserBusy(80); } catch (_) {} };
 
     const wheelOpt = { capture:true, passive:true };
     const touchOpt = { capture:true, passive:true };
@@ -2857,13 +3641,13 @@ ${CFG.CB_ITEM_SEL}.${CFG.CB_LEAVE_CLASS}{ filter: grayscale(.25) contrast(0.95);
   const uninstallUserGuard = () => { try { installUserGuard._rm && installUserGuard._rm(); } catch (_) {} };
 
   const installNavHooks = () => {
-    history.pushState = function () { const ret = ORIG.pushState.apply(this, arguments); if (on) { resyncWraps(true); scheduleBurst(700); cbKick(); visKick(true); asKick("nav"); } return ret; };
-    history.replaceState = function () { const ret = ORIG.replaceState.apply(this, arguments); if (on) { resyncWraps(true); scheduleBurst(700); cbKick(); visKick(true); asKick("nav"); } return ret; };
+    history.pushState = function () { const ret = ORIG.pushState.apply(this, arguments); if (on) { resyncWraps(true); scheduleBurst(500); cbKick(); visKick(true); asKick("nav"); } return ret; };
+    history.replaceState = function () { const ret = ORIG.replaceState.apply(this, arguments); if (on) { resyncWraps(true); scheduleBurst(500); cbKick(); visKick(true); asKick("nav"); } return ret; };
 
-    onPop = () => { if (on) { resyncWraps(true); scheduleBurst(700); cbKick(); visKick(true); asKick("nav"); } };
+    onPop = () => { if (on) { resyncWraps(true); scheduleBurst(500); cbKick(); visKick(true); asKick("nav"); } };
     addEventListener("popstate", onPop, true);
 
-    onFocus = () => { if (on) { resyncWraps(true); scheduleBurst(520); cbKick(); visKick(true); asKick("focus"); } };
+    onFocus = () => { if (on) { resyncWraps(true); scheduleBurst(400); cbKick(); visKick(true); asKick("focus"); } };
     addEventListener("focus", onFocus, false);
 
     onVis = () => {
@@ -2873,7 +3657,7 @@ ${CFG.CB_ITEM_SEL}.${CFG.CB_LEAVE_CLASS}{ filter: grayscale(.25) contrast(0.95);
       if (!hidden) {
         ecoUntil = 0;
         resyncWraps(true);
-        scheduleBurst(700);
+        scheduleBurst(500);
         cbKick();
         visKick(true);
         asKick("visible");
@@ -2914,14 +3698,14 @@ ${CFG.CB_ITEM_SEL}.${CFG.CB_LEAVE_CLASS}{ filter: grayscale(.25) contrast(0.95);
 
     const t = now();
     if (t < ecoUntil || !canServeEngineRun()) {
-      pollMs = Math.min(CFG.POLL_SLOW_MS, pollMs + 24);
+      pollMs = Math.min(CFG.POLL_SLOW_MS, pollMs + 12);
       pollTimer = setTimeout(() => pollLoop(g), Math.max(CFG.POLL_FAST_MS, pollMs));
       return;
     }
 
     const r = scanAndRegister();
     if (r.found || r.clicked) pollMs = CFG.POLL_FAST_MS;
-    else pollMs = Math.min(CFG.POLL_SLOW_MS, pollMs + 18);
+    else pollMs = Math.min(CFG.POLL_SLOW_MS, pollMs + 8);
 
     pollTimer = setTimeout(() => pollLoop(g), pollMs);
   };
@@ -2933,12 +3717,12 @@ ${CFG.CB_ITEM_SEL}.${CFG.CB_LEAVE_CLASS}{ filter: grayscale(.25) contrast(0.95);
     if (!CFG.BG_WORKER_ENABLE || bgWorker) return;
     try {
       const src = `
-        let fg = 60;
-        let bg = 220;
+        let fg = ${CFG.BG_WORKER_TICK_MS};
+        let bg = ${CFG.BG_WORKER_HIDDEN_TICK_MS};
         let timer = 0;
         const restart = (ms) => {
           try { if (timer) clearInterval(timer); } catch (_) {}
-          timer = setInterval(() => postMessage({ type: "tick" }), Math.max(25, ms || fg));
+          timer = setInterval(() => postMessage({ type: "tick" }), Math.max(15, ms || fg));
         };
         onmessage = (e) => {
           const d = e.data || {};
@@ -2967,7 +3751,7 @@ ${CFG.CB_ITEM_SEL}.${CFG.CB_LEAVE_CLASS}{ filter: grayscale(.25) contrast(0.95);
         try {
           if (!on) return;
           const t = now();
-          if ((t - bgWorkerLastAt) < 20) return;
+          if ((t - bgWorkerLastAt) < 10) return;
           bgWorkerLastAt = t;
           if (t < ecoUntil) return;
           resyncWraps(false);
@@ -2995,7 +3779,192 @@ ${CFG.CB_ITEM_SEL}.${CFG.CB_LEAVE_CLASS}{ filter: grayscale(.25) contrast(0.95);
     bgWorkerLastAt = 0;
   };
 
+  const POS_KEY = "s1_puck_pos_v1";
+
+  const updateUI = () => {
+    const d = document.getElementById(UI.PANEL_ID);
+    if (!d) return;
+    d.classList.toggle("off", !on);
+
+    const uptimeSec = Math.round((now() - STATS.startedAt) / 1000);
+    d.title = `${META.NAME} ${META.VERSION}\n` +
+      `${on ? "⚡ ACTIVE" : "⏸ OFF"}\n` +
+      `Served: ${STATS.serveClicked} | Avg: ${STATS.avgServeLatencyMs}ms\n` +
+      `CB Open: ${STATS.cbOpenClicked} | Close: ${STATS.cbCloseClicked}\n` +
+      `Uptime: ${uptimeSec}s\n` +
+      `Ctrl+Enter: On/Off | Shift+Tap: Remove`;
+  };
+
+  const buildUI = () => {
+    if (!document.getElementById(UI.STYLE_ID)) {
+      const s = document.createElement("style");
+      s.id = UI.STYLE_ID;
+      s.textContent = `
+#${UI.PANEL_ID}{
+  position:fixed; z-index:2147483647;
+  left:0; top:0; right:auto; bottom:auto;
+  width:42px; height:42px;
+  display:inline-flex; align-items:center; justify-content:center;
+  border-radius:9999px; cursor:pointer;
+  box-shadow: 0 10px 26px rgba(0,0,0,.34),
+              inset 0 1px 0 rgba(255,255,255,.12),
+              inset 0 -1px 0 rgba(0,0,0,.22);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  transition: opacity .16s ease, transform .05s linear;
+  background: linear-gradient(145deg, rgba(36,36,36,.90), rgba(10,10,10,.72));
+  touch-action:none;
+  -webkit-user-select:none; user-select:none;
+  -webkit-tap-highlight-color: transparent;
+  will-change: transform;
+  contain: layout paint style;
+}
+#${UI.PANEL_ID}.off{ opacity:.45; }
+#${UI.PANEL_ID}:active{ filter: brightness(1.03); }
+#${UI.PANEL_ID} .logo{ width:24px; height:24px; pointer-events:none; filter: drop-shadow(0 1px 2px rgba(0,0,0,.3)); }
+@media (prefers-color-scheme: light){
+  #${UI.PANEL_ID}{ background: linear-gradient(145deg, rgba(255,255,255,.95), rgba(240,240,240,.80)); }
+}`.trim();
+      (document.head || document.documentElement).appendChild(s);
+    }
+
+    let d = document.getElementById(UI.PANEL_ID);
+    if (!d) {
+      d = document.createElement("div");
+      d.id = UI.PANEL_ID;
+
+      const NS = "http://www.w3.org/2000/svg";
+      const svg = document.createElementNS(NS, "svg");
+      svg.setAttribute("viewBox", "0 -30.5 256 256");
+      svg.setAttribute("class", "logo");
+      svg.setAttribute("preserveAspectRatio", "xMidYMid");
+      const g = document.createElementNS(NS, "g");
+      const p = document.createElementNS(NS, "path");
+      p.setAttribute("d",
+        "M118.249172,51.2326115 L118.249172,194.005605 L0,194.005605 L118.249172,51.2326115 Z "+
+        "M118.249172,0 C118.249172,32.6440764 91.7686624,59.124586 59.124586,59.124586 "+
+        "C26.4805096,59.124586 0,32.6440764 0,0 L118.249172,0 Z "+
+        "M137.750828,194.005605 C137.750828,161.328917 164.198726,134.881019 196.875414,134.881019 "+
+        "C229.552102,134.881019 256,161.361529 256,194.005605 L137.750828,194.005605 Z "+
+        "M137.750828,142.740382 L137.750828,0 L256,0 L137.750828,142.740382 Z"
+      );
+      p.setAttribute("fill", "#03363D");
+      g.appendChild(p);
+      svg.appendChild(g);
+      d.appendChild(svg);
+
+      let x = 0, y = 0, w = 42, h = 42;
+      let drag = false, moved = false;
+      let startCX = 0, startCY = 0, startX = 0, startY = 0;
+      let rafPos = 0, dirty = false;
+      let capId = null;
+
+      const clamp = (vx, vy) => {
+        const vw = innerWidth || 0, vh = innerHeight || 0;
+        const pad = 6;
+        return [
+          Math.min(Math.max(pad, vx), Math.max(pad, vw - w - pad)),
+          Math.min(Math.max(pad, vy), Math.max(pad, vh - h - pad))
+        ];
+      };
+
+      const applyPos = () => {
+        rafPos = 0;
+        if (!dirty) return;
+        dirty = false;
+        d.style.transform = `translate3d(${x}px,${y}px,0)`;
+      };
+
+      const setPos = (vx, vy) => {
+        const c = clamp(vx, vy);
+        x = c[0]; y = c[1];
+        dirty = true;
+        if (!rafPos) rafPos = requestAnimationFrame(applyPos);
+      };
+
+      const loadPos = () => {
+        try {
+          const raw = localStorage.getItem(POS_KEY);
+          if (raw) {
+            const j = JSON.parse(raw);
+            if (j && Number.isFinite(j.x) && Number.isFinite(j.y)) {
+              x = j.x; y = j.y;
+              dirty = true;
+              applyPos();
+              return;
+            }
+          }
+        } catch (_) {}
+        x = Math.max(6, (innerWidth || 0) - 14 - 42);
+        y = Math.max(6, (innerHeight || 0) - 14 - 42);
+        dirty = true;
+        applyPos();
+      };
+
+      const savePos = () => { try { localStorage.setItem(POS_KEY, JSON.stringify({ x, y })); } catch (_) {} };
+
+      const refreshSize = () => {
+        try {
+          const r = d.getBoundingClientRect();
+          if (r && r.width > 0 && r.height > 0) { w = r.width; h = r.height; }
+        } catch (_) {}
+      };
+
+      loadPos();
+      refreshSize();
+
+      const onResize = () => { refreshSize(); setPos(x, y); };
+      uiRM.resize = onResize;
+      addEventListener("resize", onResize, { passive: true });
+
+      d.onpointerdown = (e) => {
+        try {
+          drag = true; moved = false;
+          refreshSize();
+          startCX = e.clientX; startCY = e.clientY;
+          startX = x; startY = y;
+          capId = e.pointerId;
+          try { d.setPointerCapture(e.pointerId); } catch (_) {}
+          if (e.cancelable) { try { e.preventDefault(); } catch (_) {} }
+        } catch (_) {}
+      };
+
+      d.onpointermove = (e) => {
+        if (!drag) return;
+        try {
+          const dx = e.clientX - startCX;
+          const dy = e.clientY - startCY;
+          if (Math.abs(dx) + Math.abs(dy) > 4) moved = true;
+          setPos(startX + dx, startY + dy);
+          if (e.cancelable) { try { e.preventDefault(); } catch (_) {} }
+        } catch (_) {}
+      };
+
+      const endDrag = () => {
+        drag = false;
+        try { if (capId != null) d.releasePointerCapture(capId); } catch (_) {}
+        capId = null;
+        savePos();
+      };
+
+      d.onpointerup = endDrag;
+      d.onpointercancel = endDrag;
+      d.onlostpointercapture = endDrag;
+
+      d.onclick = (e) => {
+        if (moved) { moved = false; return; }
+        if (e && e.shiftKey) { kill(); return; }
+        toggle();
+      };
+
+      (document.body || document.documentElement).appendChild(d);
+    }
+
+    updateUI();
+  };
+
   const startWatchers = () => {
+    startAllConcepts();
     wireRoot(document.documentElement || document);
     try { document.querySelectorAll("iframe").forEach(wireFrame); } catch (_) {}
     bindShortcut(window);
@@ -3005,13 +3974,16 @@ ${CFG.CB_ITEM_SEL}.${CFG.CB_LEAVE_CLASS}{ filter: grayscale(.25) contrast(0.95);
     visWire();
     visKick(true);
     asStart();
-    scheduleBurst(900);
+    scheduleBurst(600);
     bgWorkerStart();
+    healthStart();
 
     if (!pollTimer) {
       pollMs = CFG.POLL_FAST_MS;
       pollLoop(GEN);
     }
+
+    setInterval(() => { try { if (on) updateUI(); } catch (_) {} }, 5000);
   };
 
   const stopWatchers = () => {
@@ -3034,6 +4006,8 @@ ${CFG.CB_ITEM_SEL}.${CFG.CB_LEAVE_CLASS}{ filter: grayscale(.25) contrast(0.95);
     cbUnwire();
     visUnwire();
     asStop();
+    healthStop();
+    stopAllConcepts();
   };
 
   const toggle = () => {
@@ -3050,6 +4024,7 @@ ${CFG.CB_ITEM_SEL}.${CFG.CB_LEAVE_CLASS}{ filter: grayscale(.25) contrast(0.95);
       GEN++;
 
       stopWatchers();
+      stopAllConcepts();
       unbindShortcuts();
       uninstallNavHooks();
       uninstallShadowPatch();
@@ -3068,12 +4043,42 @@ ${CFG.CB_ITEM_SEL}.${CFG.CB_LEAVE_CLASS}{ filter: grayscale(.25) contrast(0.95);
   }
 
   window._s1panelKill = kill;
-  window._s1panelStats = () => JSON.parse(JSON.stringify(STATS));
+  window._s1panelStats = () => {
+    STATS.uptime = Math.round((now() - STATS.startedAt) / 1000);
+    STATS.multiTabPeers = multiTab.peers.size;
+    STATS.isLeader = multiTab.isLeader;
+    STATS.predictNextServeIn = predict.ema > 0
+      ? Math.max(0, Math.round(predict.ema - (now() - predict.lastServeAt)))
+      : "unknown";
+    return JSON.parse(JSON.stringify(STATS));
+  };
 
+  window._s1panelCfg = () => JSON.parse(JSON.stringify(CFG));
+  window._s1panelSet = (key, val) => {
+    if (key in CFG) { CFG[key] = val; return true; }
+    return false;
+  };
+
+  STATS.startedAt = now();
   lastUserAt = now();
+  health.lastActivityAt = now();
   buildUI();
   installUserGuard();
   installNavHooks();
   installShadowPatch();
   startWatchers();
+
+  console.log(
+    `%c⚡ ${META.NAME} ${META.VERSION} — LOADED`,
+    "color:#00ff88;font-weight:bold;font-size:14px;",
+    "\nCtrl+Enter = Toggle | Shift+Click Puck = Remove",
+    "\nWS Intercept: " + (CFG.WS_INTERCEPT_ENABLE ? "ON" : "OFF") +
+      " | Fetch Hook: " + (CFG.FETCH_HOOK_ENABLE ? "ON" : "OFF") +
+      " | Multi-Tab: " + (CFG.MULTI_TAB_ENABLE ? "ON" : "OFF"),
+    "\nTurbo Click: " + (CFG.TURBO_CLICK_ENABLE ? "ON" : "OFF") +
+      " | Audio: " + (CFG.AUDIO_ENABLE ? "ON" : "OFF") +
+      " | Self-Heal: " + (CFG.SELF_HEAL_ENABLE ? "ON" : "OFF"),
+    "\nwindow._s1panelStats() = View stats",
+    "\nwindow._s1panelSet(key, val) = Runtime config"
+  );
 })();
